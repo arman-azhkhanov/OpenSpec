@@ -13,6 +13,8 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 import { makeStoreDiagnostic, type StoreDiagnostic } from './store/errors.js';
+import { buildCodeFenceMask, buildStructureMask } from './parsers/code-fence.js';
+import { defaultFormat, type ResolvedFormat } from './parsers/grammar.js';
 import {
   isValidStoreId,
   listStoreRegistryEntries,
@@ -104,12 +106,18 @@ function stripClosingSequence(title: string): string {
 }
 
 /**
- * Heading title, or null when the line is not an ATX heading. Hand-rolled
- * rather than a regex so a title padded with whitespace cannot backtrack.
+ * Heading title, or null when the line is not a heading. Hand-rolled rather
+ * than a regex so a title padded with whitespace cannot backtrack.
+ *
+ * FORK-ONLY branch: the marker is the format's — `#` in Markdown, `*` in Org —
+ * because no token template expresses a heading marker. The CommonMark closing
+ * sequence is stripped only in Markdown, which is the family that defines it; a
+ * trailing `#` in an Org heading is part of the title.
  */
-function parseHeadingTitle(line: string): string | null {
+function parseHeadingTitle(line: string, format: ResolvedFormat): string | null {
+  const marker = format.markup === 'org' ? '*' : '#';
   let level = 0;
-  while (level < 6 && level < line.length && line[level] === '#') {
+  while (level < 6 && level < line.length && line[level] === marker) {
     level++;
   }
   if (level === 0 || level >= line.length || !WHITESPACE.test(line[level])) {
@@ -121,17 +129,23 @@ function parseHeadingTitle(line: string): string | null {
     start++;
   }
 
-  return stripClosingSequence(line.slice(start));
+  const title = line.slice(start);
+  return format.markup === 'org' ? title.trim() : stripClosingSequence(title);
 }
 
 /**
- * Tolerant first-Purpose-line extraction. parseSpec() throws on specs
- * without Purpose/Requirements sections; the index must never fail on an
- * imperfect upstream spec, so this scans for the heading directly —
- * fence-aware, so `## Purpose` inside a code block never matches, and
- * tolerant of CommonMark closing hashes (`## Purpose ##`).
+ * The Markdown scan, kept exactly as this file has always run it: its own
+ * marker loop, in which a fence closes on the marker KIND alone.
+ *
+ * It is looser than the parsers' shared fence mask, which follows CommonMark
+ * (a closer must be at least as long as its opener and carry nothing else on
+ * the line). Routing Markdown through the shared mask changed which line this
+ * function calls a spec's summary — a store index that quietly re-reads its
+ * inputs is a behavior change no schema asked for, so the two are kept apart
+ * and only Org, which has no prior behavior to preserve, reads through the
+ * shared masks.
  */
-export function extractFirstPurposeLine(markdown: string): string {
+function firstPurposeLineMarkdown(markdown: string, format: ResolvedFormat): string {
   const lines = markdown.split(/\r?\n/);
   let inPurpose = false;
   let fenceMarker: string | null = null;
@@ -151,7 +165,7 @@ export function extractFirstPurposeLine(markdown: string): string {
       continue;
     }
 
-    const title = parseHeadingTitle(line);
+    const title = parseHeadingTitle(line, format);
     if (title !== null) {
       if (inPurpose) {
         return '';
@@ -167,7 +181,57 @@ export function extractFirstPurposeLine(markdown: string): string {
   return '';
 }
 
-async function collectSpecEntries(referencedRoot: string): Promise<ReferenceSpecEntry[]> {
+/**
+ * Tolerant first-Purpose-line extraction. parseSpec() throws on specs
+ * without Purpose/Requirements sections; the index must never fail on an
+ * imperfect upstream spec, so this scans for the heading directly —
+ * fence-aware, so `## Purpose` inside a code block never matches, and
+ * tolerant of CommonMark closing hashes (`## Purpose ##`).
+ *
+ * Markdown keeps this file's original loop byte for byte (see
+ * `firstPurposeLineMarkdown`). Org uses the parsers' shared masks, which is
+ * where the two of them differ on purpose: a heading inside `#+begin_src` is
+ * still a heading (structure mask), while the fenced body is still not prose
+ * to quote as a summary (fence mask).
+ */
+export function extractFirstPurposeLine(
+  markdown: string,
+  format: ResolvedFormat = defaultFormat()
+): string {
+  if (format.markup !== 'org') {
+    return firstPurposeLineMarkdown(markdown, format);
+  }
+
+  const lines = markdown.split(/\r?\n/);
+  const structural = buildStructureMask(lines, format);
+  const fenced = buildCodeFenceMask(lines, format);
+  let inPurpose = false;
+
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index];
+    const title = structural[index] ? null : parseHeadingTitle(line, format);
+    if (title !== null) {
+      if (inPurpose) {
+        return '';
+      }
+      inPurpose = title.toLowerCase() === 'purpose';
+      continue;
+    }
+    if (fenced[index]) {
+      continue;
+    }
+    if (inPurpose && line.trim().length > 0) {
+      return line.trim();
+    }
+  }
+
+  return '';
+}
+
+async function collectSpecEntries(
+  referencedRoot: string,
+  format: ResolvedFormat
+): Promise<ReferenceSpecEntry[]> {
   const specIds = await getSpecIds(referencedRoot);
 
   return Promise.all(
@@ -175,10 +239,10 @@ async function collectSpecEntries(referencedRoot: string): Promise<ReferenceSpec
       let summary = '';
       try {
         const content = await fs.readFile(
-          path.join(referencedRoot, 'openspec', 'specs', specId, 'spec.md'),
+          path.join(referencedRoot, 'openspec', 'specs', specId, format.SPEC_FILE),
           'utf-8'
         );
-        summary = sanitizeInline(extractFirstPurposeLine(content));
+        summary = sanitizeInline(extractFirstPurposeLine(content, format));
       } catch {
         // Unreadable spec file: index the id with an empty summary.
       }
@@ -295,6 +359,12 @@ export interface AssembleReferenceIndexInput {
    * read result: a healthy-absent registry reads as null.)
    */
   registryEntries?: ReturnType<typeof listStoreRegistryEntries> | null;
+  /**
+   * Format the referenced stores' specs are written in. Absent means the
+   * built-in default: a referenced store is another root with its own schema,
+   * and this index never loads it, so nothing here may assume otherwise.
+   */
+  format?: ResolvedFormat;
 }
 
 /**
@@ -325,6 +395,7 @@ export async function assembleReferenceIndex(
     }
   }
   const includeSpecs = input.includeSpecs !== false;
+  const format = input.format ?? defaultFormat();
 
   const resolvedRootPath = FileSystemUtils.canonicalizeExistingPath(input.resolvedRoot.path);
   const entries: ReferenceIndexEntry[] = [];
@@ -413,7 +484,7 @@ export async function assembleReferenceIndex(
       continue;
     }
 
-    const specs = await collectSpecEntries(inspection.canonicalRoot);
+    const specs = await collectSpecEntries(inspection.canonicalRoot, format);
     const entry: ReferenceIndexEntry = {
       store_id: id,
       root: inspection.canonicalRoot,

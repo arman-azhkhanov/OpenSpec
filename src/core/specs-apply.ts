@@ -19,7 +19,8 @@ import {
   type RequirementsSectionParts,
 } from './parsers/requirement-blocks.js';
 import { findMainSpecStructureIssues } from './parsers/spec-structure.js';
-import { buildCodeFenceMask } from './parsers/code-fence.js';
+import { buildStructureMask } from './parsers/code-fence.js';
+import { defaultFormat, type ResolvedFormat } from './parsers/grammar.js';
 import { MarkdownParser } from './parsers/markdown-parser.js';
 import { MIN_PURPOSE_LENGTH } from './validation/constants.js';
 import { discoverSpecFiles } from '../utils/spec-discovery.js';
@@ -93,18 +94,27 @@ function assertTrustedSpecPath(root: string, specPath: string): void {
 
 /**
  * Find all delta spec files that need to be applied from a change.
+ *
+ * The format is the caller's to resolve (`resolveSpecArtifactFormat`, which
+ * reads it off the change's schema): this module is handed one rather than
+ * loading a schema of its own, so there is a single place that decides what a
+ * change's specs are written in.
  */
-export async function findSpecUpdates(changeDir: string, mainSpecsDir: string): Promise<SpecUpdate[]> {
+export async function findSpecUpdates(
+  changeDir: string,
+  mainSpecsDir: string,
+  format: ResolvedFormat = defaultFormat()
+): Promise<SpecUpdate[]> {
   const updates: SpecUpdate[] = [];
   const changeSpecsDir = path.join(changeDir, 'specs');
 
   // Discover delta specs recursively so nested layouts like
-  // specs/<area>/<capability>/spec.md merge into the same relative path
+  // specs/<area>/<capability>/<SPEC_FILE> merge into the same relative path
   // under the main specs directory (#1353)
-  const discovered = await discoverSpecFiles(changeSpecsDir);
+  const discovered = await discoverSpecFiles(changeSpecsDir, format);
 
   for (const { id, specFile } of discovered) {
-    const targetFile = path.join(mainSpecsDir, ...id.split('/'), 'spec.md');
+    const targetFile = path.join(mainSpecsDir, ...id.split('/'), format.SPEC_FILE);
     const source = resolveTrustedSpecPath(changeSpecsDir, specFile);
     const target = resolveTrustedSpecPath(mainSpecsDir, targetFile);
 
@@ -137,7 +147,8 @@ export async function findSpecUpdates(changeDir: string, mainSpecsDir: string): 
 export async function buildUpdatedSpec(
   update: SpecUpdate,
   changeName: string,
-  options: { silent?: boolean } = {}
+  options: { silent?: boolean } = {},
+  format: ResolvedFormat = defaultFormat()
 ): Promise<{
   rebuilt: string;
   counts: { added: number; modified: number; removed: number; renamed: number };
@@ -191,8 +202,12 @@ export async function buildUpdatedSpec(
   const changeContent = await fs.readFile(update.source, 'utf-8');
 
   // Parse deltas from the change spec file
-  const plan = parseDeltaSpec(changeContent);
+  const plan = parseDeltaSpec(changeContent, format);
   const specName = update.id;
+  // Every header quoted back to the author is the header of THIS format: a
+  // message that answers an Org spec with `### Requirement:` names a line the
+  // author cannot find in the file being merged.
+  const header = (name: string) => format.requirementHeaderLine(name);
 
   // Pre-validate duplicates within sections
   const addedNames = new Set<string>();
@@ -200,7 +215,7 @@ export async function buildUpdatedSpec(
     const name = normalizeRequirementName(add.name);
     if (addedNames.has(name)) {
       throw new Error(
-        `${specName} validation failed - duplicate requirement in ADDED for header "### Requirement: ${add.name}"`
+        `${specName} validation failed - duplicate requirement in ADDED for header "${header(add.name)}"`
       );
     }
     addedNames.add(name);
@@ -210,7 +225,7 @@ export async function buildUpdatedSpec(
     const name = normalizeRequirementName(mod.name);
     if (modifiedNames.has(name)) {
       throw new Error(
-        `${specName} validation failed - duplicate requirement in MODIFIED for header "### Requirement: ${mod.name}"`
+        `${specName} validation failed - duplicate requirement in MODIFIED for header "${header(mod.name)}"`
       );
     }
     modifiedNames.add(name);
@@ -220,7 +235,7 @@ export async function buildUpdatedSpec(
     const name = normalizeRequirementName(rem);
     if (removedNamesSet.has(name)) {
       throw new Error(
-        `${specName} validation failed - duplicate requirement in REMOVED for header "### Requirement: ${rem}"`
+        `${specName} validation failed - duplicate requirement in REMOVED for header "${header(rem)}"`
       );
     }
     removedNamesSet.add(name);
@@ -232,12 +247,12 @@ export async function buildUpdatedSpec(
     const toNorm = normalizeRequirementName(to);
     if (renamedFromSet.has(fromNorm)) {
       throw new Error(
-        `${specName} validation failed - duplicate FROM in RENAMED for header "### Requirement: ${from}"`
+        `${specName} validation failed - duplicate FROM in RENAMED for header "${header(from)}"`
       );
     }
     if (renamedToSet.has(toNorm)) {
       throw new Error(
-        `${specName} validation failed - duplicate TO in RENAMED for header "### Requirement: ${to}"`
+        `${specName} validation failed - duplicate TO in RENAMED for header "${header(to)}"`
       );
     }
     renamedFromSet.add(fromNorm);
@@ -268,26 +283,26 @@ export async function buildUpdatedSpec(
     );
     if (removedFoldMatch !== undefined) {
       throw new Error(
-        `${specName} validation failed - requirement present in multiple sections (RENAMED and REMOVED) for header "### Requirement: ${from}"` +
+        `${specName} validation failed - requirement present in multiple sections (RENAMED and REMOVED) for header "${header(from)}"` +
           (removedFoldMatch === fromNorm ? '' : ` (REMOVED spells it "${removedFoldMatch}")`)
       );
     }
     if (modifiedNames.has(fromNorm)) {
       throw new Error(
-        `${specName} validation failed - when a rename exists, MODIFIED must reference the NEW header "### Requirement: ${to}"`
+        `${specName} validation failed - when a rename exists, MODIFIED must reference the NEW header "${header(to)}"`
       );
     }
     // Detect ADDED colliding with a RENAMED TO
     if (addedNames.has(toNorm)) {
       throw new Error(
-        `${specName} validation failed - RENAMED TO header collides with ADDED for "### Requirement: ${to}"`
+        `${specName} validation failed - RENAMED TO header collides with ADDED for "${header(to)}"`
       );
     }
   }
   if (conflicts.length > 0) {
     const c = conflicts[0];
     throw new Error(
-      `${specName} validation failed - requirement present in multiple sections (${c.a} and ${c.b}) for header "### Requirement: ${c.name}"`
+      `${specName} validation failed - requirement present in multiple sections (${c.a} and ${c.b}) for header "${header(c.name)}"`
     );
   }
   const hasAnyDelta = plan.added.length + plan.modified.length + plan.removed.length + plan.renamed.length > 0;
@@ -299,7 +314,7 @@ export async function buildUpdatedSpec(
   }
 
   // Load or create base target content
-  const deltaPurpose = extractPurposeSection(changeContent);
+  const deltaPurpose = extractPurposeSection(changeContent, format);
   let targetContent: string;
   let isNewSpec = false;
   assertTrustedSpecPath(update.targetRoot, update.target);
@@ -312,7 +327,7 @@ export async function buildUpdatedSpec(
     // "already has one" would be false when it has none, and saying anything at
     // all is noise when the two bodies match.
     if (deltaPurpose) {
-      const existingPurpose = extractPurposeSection(targetContent);
+      const existingPurpose = extractPurposeSection(targetContent, format);
       if (existingPurpose && existingPurpose !== deltaPurpose) {
         warn(
           `${specName} - delta Purpose ignored; ${specName} already has one. ` +
@@ -335,12 +350,12 @@ export async function buildUpdatedSpec(
       );
     }
     isNewSpec = true;
-    targetContent = buildSpecSkeleton(specName, changeName, deltaPurpose);
-    const overview = deltaPurpose ? readableOverview(targetContent, specName) : null;
+    targetContent = buildSpecSkeleton(specName, changeName, deltaPurpose, format);
+    const overview = deltaPurpose ? readableOverview(targetContent, specName, format) : null;
     if (deltaPurpose && !overview) {
       // Keep the placeholder rather than turning this into a failure: these
       // deltas archived cleanly before the Purpose carry-over existed.
-      targetContent = buildSpecSkeleton(specName, changeName);
+      targetContent = buildSpecSkeleton(specName, changeName, undefined, format);
       warn(
         `${specName} - delta Purpose ignored (it would leave the new spec unreadable); wrote the placeholder Purpose instead.`
       );
@@ -355,7 +370,7 @@ export async function buildUpdatedSpec(
     }
   }
 
-  const structureIssues = findMainSpecStructureIssues(targetContent);
+  const structureIssues = findMainSpecStructureIssues(targetContent, format);
   if (structureIssues.length > 0) {
     const details = structureIssues
       .map(issue => `line ${issue.line}: ${issue.message}`)
@@ -366,7 +381,7 @@ export async function buildUpdatedSpec(
   }
 
   // Extract requirements section and build name->block map
-  const parts = extractRequirementsSection(targetContent);
+  const parts = extractRequirementsSection(targetContent, format);
   const nameToBlock = new Map<string, RequirementBlock>();
   for (const block of parts.bodyBlocks) {
     nameToBlock.set(normalizeRequirementName(block.name), block);
@@ -392,18 +407,21 @@ export async function buildUpdatedSpec(
         );
         if (nearMiss !== undefined) {
           throw new Error(
-            `${specName} RENAMED failed for header "### Requirement: ${r.from}" - source not found, but "### Requirement: ${nameToBlock.get(nearMiss)!.name}" exists; fix the header to match it exactly`
+            `${specName} RENAMED failed for header "${header(r.from)}" - source not found, but "${header(nameToBlock.get(nearMiss)!.name)}" exists; fix the header to match it exactly`
           );
         }
         continue;
       }
-      throw new Error(`${specName} RENAMED failed for header "### Requirement: ${r.from}" - source not found`);
+      throw new Error(`${specName} RENAMED failed for header "${header(r.from)}" - source not found`);
     }
     if (nameToBlock.has(to)) {
-      throw new Error(`${specName} RENAMED failed for header "### Requirement: ${r.to}" - target already exists`);
+      throw new Error(`${specName} RENAMED failed for header "${header(r.to)}" - target already exists`);
     }
     const block = nameToBlock.get(from)!;
-    const newHeader = `### Requirement: ${to}`;
+    const newHeader = header(to);
+    // Only the header line is rewritten, so a property drawer sitting under it
+    // rides along untouched: a rename changes the name a requirement is known
+    // by, never its identity (that is what makes "who touched R" survive one).
     const rawLines = block.raw.split('\n');
     rawLines[0] = newHeader;
     const renamedBlock: RequirementBlock = {
@@ -432,7 +450,7 @@ export async function buildUpdatedSpec(
         const nearMiss = [...nameToBlock.keys()].find((k) => foldRequirementName(k) === foldRequirementName(key));
         if (nearMiss !== undefined) {
           throw new Error(
-            `${specName} REMOVED failed for header "### Requirement: ${name}" - not found, but "### Requirement: ${nameToBlock.get(nearMiss)!.name}" exists; fix the header to match it exactly`
+            `${specName} REMOVED failed for header "${header(name)}" - not found, but "${header(nameToBlock.get(nearMiss)!.name)}" exists; fix the header to match it exactly`
           );
         }
         warn(
@@ -451,29 +469,34 @@ export async function buildUpdatedSpec(
     const key = normalizeRequirementName(mod.name);
     const currentBlock = nameToBlock.get(key);
     if (!currentBlock) {
-      throw new Error(`${specName} MODIFIED failed for header "### Requirement: ${mod.name}" - not found`);
+      throw new Error(`${specName} MODIFIED failed for header "${header(mod.name)}" - not found`);
     }
     // Replace block with provided raw (ensure header line matches key)
-    const modHeaderMatch = mod.raw.split('\n')[0].match(/^###\s*Requirement:\s*(.+)\s*$/i);
+    const modHeaderMatch = mod.raw.split('\n')[0].match(format.H3_REQUIREMENT_LOOSE);
     if (!modHeaderMatch || normalizeRequirementName(modHeaderMatch[1]) !== key) {
       throw new Error(
-        `${specName} MODIFIED failed for header "### Requirement: ${mod.name}" - header mismatch in content`
+        `${specName} MODIFIED failed for header "${header(mod.name)}" - header mismatch in content`
       );
     }
-    const missingScenarios = findMissingCurrentScenarios(currentBlock, mod);
+    const missingScenarios = findMissingCurrentScenarios(currentBlock, mod, format);
     if (missingScenarios.length > 0) {
       throw new Error(
-        `${specName} MODIFIED failed for header "### Requirement: ${mod.name}" - current spec contains scenario(s) not present in the modified block: ${missingScenarios.map(name => `"${name}"`).join(', ')}. Refresh the change spec before archiving to avoid dropping scenarios.`
+        `${specName} MODIFIED failed for header "${header(mod.name)}" - current spec contains scenario(s) not present in the modified block: ${missingScenarios.map(name => `"${name}"`).join(', ')}. Refresh the change spec before archiving to avoid dropping scenarios.`
       );
     }
+    // A modified block replaces the whole requirement, so an identity the main
+    // spec already carries would go with it. Carried over unless the delta
+    // states one of its own, which is the author's to keep and the validator's
+    // to judge.
+    const replacement = carryRequirementId(currentBlock, mod, format);
     // Identical content means the modification was already synced to the
     // baseline (early-sync pattern) — count only real replacements, so a
     // fully synced change still takes the "already in sync" write skip
     // instead of churning normalization differences into the file.
-    if (normalizeBlockRaw(currentBlock.raw) !== normalizeBlockRaw(mod.raw)) {
+    if (normalizeBlockRaw(currentBlock.raw, format) !== normalizeBlockRaw(replacement.raw, format)) {
       modifiedApplied++;
     }
-    nameToBlock.set(key, mod);
+    nameToBlock.set(key, replacement);
   }
 
   // ADDED
@@ -484,13 +507,18 @@ export async function buildUpdatedSpec(
     if (existing) {
       // Identical content means the requirement was already synced to the
       // baseline (early-sync pattern) — re-applying it is a no-op, not a
-      // conflict. Only differing content is a genuine collision.
-      if (normalizeBlockRaw(existing.raw) === normalizeBlockRaw(add.raw)) {
+      // conflict. Only differing content is a genuine collision. Compared with
+      // identity drawers stripped: an id minted by an earlier apply is not a
+      // content difference the author wrote.
+      if (normalizeBlockRaw(existing.raw, format) === normalizeBlockRaw(add.raw, format)) {
         continue;
       }
-      throw new Error(`${specName} ADDED failed for header "### Requirement: ${add.name}" - already exists`);
+      throw new Error(`${specName} ADDED failed for header "${header(add.name)}" - already exists`);
     }
-    nameToBlock.set(key, add);
+    // ADDED is the one operation that introduces a requirement, so it is where
+    // a stable identity is minted (formats without property drawers get the
+    // block back unchanged).
+    nameToBlock.set(key, mintRequirementId(add, specName, format));
     addedApplied++;
   }
 
@@ -516,18 +544,18 @@ export async function buildUpdatedSpec(
     const replacementFromOriginal =
       replacement ?? (renamedTarget ? nameToBlock.get(renamedTarget) : undefined);
     if (replacementFromOriginal !== block) {
-      const foreign = firstForeignTail(block.raw);
+      const foreign = firstForeignTail(block.raw, format);
       const replacementRaw = replacementFromOriginal?.raw;
-      const normalizedForeign = foreign ? normalizeBlockRaw(foreign.raw) : '';
+      const normalizedForeign = foreign ? normalizeBlockRaw(foreign.raw, format) : '';
       const keepsForeignTail =
         foreign !== undefined &&
         replacementRaw !== undefined &&
-        countOccurrences(normalizeBlockRaw(replacementRaw), normalizedForeign) >=
-          countOccurrences(normalizeBlockRaw(block.raw), normalizedForeign);
+        countOccurrences(normalizeBlockRaw(replacementRaw, format), normalizedForeign) >=
+          countOccurrences(normalizeBlockRaw(block.raw, format), normalizedForeign);
       if (foreign && !keepsForeignTail) {
         warn(
           `${specName} - "${foreign.heading}" sits inside requirement "${block.name}" and goes with it. ` +
-            'Move it under its own requirement, or above `## Requirements`, to keep it.'
+            `Move it under its own requirement, or above \`${format.requirementsSectionLine()}\`, to keep it.`
         );
       }
     }
@@ -572,7 +600,7 @@ export async function buildUpdatedSpec(
     // is discarded with it, so a rebuilt-body scan only ever sees headings above
     // the first requirement - it would veto `### Notes` written before the
     // requirements and miss the identical heading written after them.
-    unaccountedContent: contentTheMergeCannotName(parts),
+    unaccountedContent: contentTheMergeCannotName(parts, format),
   };
 }
 
@@ -589,12 +617,15 @@ export async function buildUpdatedSpec(
  * line-based rule separates them; a wrong warning costs a line of output, while
  * acting on a wrong answer would rewrite the spec.
  */
-function firstForeignTail(raw: string): { heading: string; raw: string } | undefined {
+function firstForeignTail(
+  raw: string,
+  format: ResolvedFormat = defaultFormat()
+): { heading: string; raw: string } | undefined {
   const lines = raw.replace(/\r\n?/g, '\n').split('\n');
-  const fenceMask = buildCodeFenceMask(lines);
+  const fenceMask = buildStructureMask(lines, format);
   for (let index = 1; index < lines.length; index++) {
     if (fenceMask[index]) continue;
-    if (/^ {0,3}#{1,3}(?:[ \t]|$)/.test(lines[index])) {
+    if (isForeignHeading(lines[index], format)) {
       return {
         heading: lines[index].trim(),
         raw: lines.slice(index).join('\n').trimEnd(),
@@ -605,6 +636,114 @@ function firstForeignTail(raw: string): { heading: string; raw: string } | undef
 }
 
 /**
+ * A heading above scenario depth inside a requirement block — depth counted the
+ * same way in both families (Org's `**` is Markdown's `###`).
+ *
+ * FORK-ONLY branch. The Markdown literal is kept verbatim rather than compiled
+ * from the grammar because its leniency is its own: up to three leading spaces,
+ * and a marker run that a bare end of line terminates. Neither is expressible
+ * as a token, and swapping in the stricter shared anchor would silently change
+ * which Markdown specs can be retired.
+ */
+function isForeignHeading(line: string, format: ResolvedFormat): boolean {
+  if (format.markup === 'org') {
+    const level = format.headingLevel(line);
+    return level !== null && level <= 3;
+  }
+  return /^ {0,3}#{1,3}(?:[ \t]|$)/.test(line);
+}
+
+/**
+ * FORK-ONLY. The span of a requirement block's property drawer, or null when
+ * the block has none (and in every family that has no drawers at all).
+ *
+ * A drawer belongs to the header it sits under, so only the one opening on the
+ * first non-blank line after the header counts.
+ */
+function propertyDrawerSpan(
+  lines: string[],
+  format: ResolvedFormat
+): { start: number; end: number } | null {
+  if (!format.PROPERTIES_OPEN || !format.DRAWER_END) return null;
+  let start = 1;
+  while (start < lines.length && !lines[start].trim()) start++;
+  if (start >= lines.length || !format.PROPERTIES_OPEN.test(lines[start])) return null;
+  for (let end = start + 1; end < lines.length; end++) {
+    if (format.DRAWER_END.test(lines[end])) return { start, end };
+  }
+  // An unterminated drawer is a validation error, not a span to act on.
+  return null;
+}
+
+/** FORK-ONLY. The identity a requirement block declares, if any. */
+function readRequirementId(raw: string, format: ResolvedFormat): string | undefined {
+  if (!format.ID_PROPERTY) return undefined;
+  const lines = raw.replace(/\r\n?/g, '\n').split('\n');
+  const span = propertyDrawerSpan(lines, format);
+  if (!span) return undefined;
+  for (let index = span.start + 1; index < span.end; index++) {
+    const match = lines[index].match(format.ID_PROPERTY);
+    if (match) return match[1];
+  }
+  return undefined;
+}
+
+/** FORK-ONLY. The block with `id` in its drawer, added or left as it stands. */
+function writeRequirementId(raw: string, id: string, format: ResolvedFormat): string {
+  if (!format.PROPERTIES_OPEN || !format.DRAWER_END || !format.ID_PROPERTY) return raw;
+  const lines = raw.replace(/\r\n?/g, '\n').split('\n');
+  const span = propertyDrawerSpan(lines, format);
+  if (span) {
+    for (let index = span.start + 1; index < span.end; index++) {
+      if (format.ID_PROPERTY.test(lines[index])) {
+        lines[index] = `:ID: ${id}`;
+        return lines.join('\n');
+      }
+    }
+    lines.splice(span.start + 1, 0, `:ID: ${id}`);
+    return lines.join('\n');
+  }
+  lines.splice(1, 0, ':PROPERTIES:', `:ID: ${id}`, ':END:');
+  return lines.join('\n');
+}
+
+/**
+ * The block as it should land for an ADDED requirement: identity minted from
+ * the capability and the header AS WRITTEN AT THIS MOMENT, then never re-derived
+ * — a later rename changes the name, and re-deriving the slug from the new title
+ * is precisely what would break the trail of who touched the requirement.
+ */
+function mintRequirementId(
+  block: RequirementBlock,
+  capability: string,
+  format: ResolvedFormat
+): RequirementBlock {
+  if (!format.ID_PROPERTY) return block;
+  const id = readRequirementId(block.raw, format) ?? format.requirementId(capability, block.name);
+  const raw = writeRequirementId(block.raw, id, format);
+  return raw === block.raw ? block : { ...block, raw };
+}
+
+/** The incoming block carrying the current block's identity when it states none. */
+function carryRequirementId(
+  current: RequirementBlock,
+  incoming: RequirementBlock,
+  format: ResolvedFormat
+): RequirementBlock {
+  if (!format.ID_PROPERTY) return incoming;
+  if (readRequirementId(incoming.raw, format) !== undefined) return incoming;
+  const carried = readRequirementId(current.raw, format);
+  if (carried === undefined) return incoming;
+  return { ...incoming, raw: writeRequirementId(incoming.raw, carried, format) };
+}
+
+/**
+ * FORK-ONLY. An Org file titles itself with a keyword line, so the title is not
+ * a heading one level above the sections the way Markdown's is.
+ */
+const ORG_TITLE_KEYWORD = /^#\+TITLE:/i;
+
+/**
  * The non-blank lines of a spec that are not part of what a retirement is able
  * to name: the title, the `## Purpose` section, the `## Requirements` header,
  * and each requirement block's own header, statement and scenario bullets.
@@ -613,13 +752,17 @@ function firstForeignTail(raw: string): { heading: string; raw: string } | undef
  * prose inside a removed block, and content above the requirements section, be
  * deleted unmentioned.
  */
-function contentTheMergeCannotName(parts: RequirementsSectionParts): string[] {
+function contentTheMergeCannotName(
+  parts: RequirementsSectionParts,
+  format: ResolvedFormat = defaultFormat()
+): string[] {
   const leftovers: string[] = [];
+  const org = format.markup === 'org';
 
   // Above the requirements section: the title and the Purpose section are
   // expected; anything else is authored content the deletion would take.
   const beforeLines = parts.before.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n').split('\n');
-  const beforeMask = buildCodeFenceMask(beforeLines);
+  const beforeMask = buildStructureMask(beforeLines, format);
   let inPurpose = false;
   let titleSeen = false;
   let previousLine = '';
@@ -630,9 +773,12 @@ function contentTheMergeCannotName(parts: RequirementsSectionParts): string[] {
       continue;
     }
     if (!beforeMask[index]) {
-      const section = line.match(/^ {0,3}##\s+(.+?)\s*$/);
+      // The section anchor is the format's own top-level heading. The Markdown
+      // shape keeps its leading-space tolerance, which no token expresses.
+      const section = org ? line.match(format.H2_TITLED) : line.match(/^ {0,3}##\s+(.+?)\s*$/);
       if (section) {
-        inPurpose = /^purpose$/i.test(section[1].trim());
+        const title = (org ? section[2] : section[1]).trim();
+        inPurpose = /^purpose$/i.test(title);
         if (!inPurpose) leftovers.push(line.trim());
         previousLine = line;
         continue;
@@ -642,15 +788,23 @@ function contentTheMergeCannotName(parts: RequirementsSectionParts): string[] {
       // reader sees a sibling of `## Purpose`, not more of its body. Treating
       // everything up to the next ATX `##` as Purpose swallowed those whole and
       // deleted them, reported as nothing but "Purpose".
-      const setext = inPurpose && previousLine.trim() && /^ {0,3}(=+|-+)\s*$/.test(line);
-      const htmlHeading = /^ {0,3}<h[1-6]\b/i.test(line);
+      //
+      // FORK-ONLY: both shapes are Markdown's. Org has no setext underline (a
+      // row of dashes is a rule) and raw HTML lives inside an export block, so
+      // reading either as a heading there would refuse retirements over
+      // ordinary prose.
+      const setext =
+        !org && inPurpose && previousLine.trim() && /^ {0,3}(=+|-+)\s*$/.test(line);
+      const htmlHeading = !org && /^ {0,3}<h[1-6]\b/i.test(line);
       if (setext || htmlHeading) {
         leftovers.push((setext ? previousLine : line).trim());
         inPurpose = false;
         previousLine = line;
         continue;
       }
-      if (/^ {0,3}#\s+.+$/.test(line)) {
+      // The document title: an Org file titles itself with a keyword line
+      // rather than a heading one level above the sections.
+      if (org ? ORG_TITLE_KEYWORD.test(line) : /^ {0,3}#\s+.+$/.test(line)) {
         if (!titleSeen && !inPurpose) {
           titleSeen = true;
         } else {
@@ -677,11 +831,14 @@ function contentTheMergeCannotName(parts: RequirementsSectionParts): string[] {
   // a new header rides along in `raw` - tables, fences, comments, prose written
   // below the scenarios. Only a requirement's own parts are expected here.
   for (const block of parts.bodyBlocks) {
-    const foreignTail = firstForeignTail(block.raw);
+    const foreignTail = firstForeignTail(block.raw, format);
     if (foreignTail) leftovers.push(foreignTail.heading);
 
     const lines = block.raw.replace(/\r\n?/g, '\n').split('\n');
-    const mask = buildCodeFenceMask(lines);
+    const mask = buildStructureMask(lines, format);
+    // The requirement's own identity drawer is part of the requirement, not
+    // authored prose the deletion would take.
+    const drawer = propertyDrawerSpan(lines, format);
     let seenScenario = false;
     // A scenario's bullets run unbroken beneath its header. A blank line after
     // them ends the scenario, so bullets written past that point are a note the
@@ -698,13 +855,15 @@ function contentTheMergeCannotName(parts: RequirementsSectionParts): string[] {
         if (bulletsSeen) inScenarioBullets = false;
         continue;
       }
-      if (index === 0) continue; // the `### Requirement:` header itself
+      if (index === 0) continue; // the requirement header itself
+      if (drawer && index >= drawer.start && index <= drawer.end) continue;
       // Fenced lines render as a code block inside the requirement, so they are
       // its own content however they are spelled - a `### Requirement:` in an
       // example is not a heading to any reader. Flagging them made a spec that
       // merely documents a command unretirable.
       if (mask[index]) continue;
       if (
+        !org &&
         index > 1 &&
         /^ {0,3}(?:=+|-+)\s*$/.test(line) &&
         lines[index - 1].trim()
@@ -712,13 +871,13 @@ function contentTheMergeCannotName(parts: RequirementsSectionParts): string[] {
         leftovers.push(lines[index - 1].trim());
         continue;
       }
-      if (/^ {0,3}####\s+Scenario:/i.test(line)) {
+      if (format.H4_SCENARIO_TITLED.test(line)) {
         seenScenario = true;
         inScenarioBullets = true;
         bulletsSeen = false;
         continue;
       }
-      if (/^\s*(?:[-*]|\d+[.)])\s/.test(line)) {
+      if (format.LIST_BULLET.test(line) || /^\s*\d+[.)]\s/.test(line)) {
         if (inScenarioBullets) {
           bulletsSeen = true;
           continue;
@@ -738,8 +897,21 @@ function contentTheMergeCannotName(parts: RequirementsSectionParts): string[] {
   return [...new Set(leftovers)];
 }
 
-function normalizeBlockRaw(raw: string): string {
-  return raw.replace(/\r\n?/g, '\n').trim();
+/**
+ * The comparable body of a block: line endings normalized, and the identity
+ * drawer dropped.
+ *
+ * Identity is not content. An id minted by an earlier apply lives in the main
+ * spec and never in the delta, so comparing raws with it in would read an
+ * already-synced requirement as a conflicting rewrite of itself.
+ */
+function normalizeBlockRaw(raw: string, format: ResolvedFormat = defaultFormat()): string {
+  const normalized = raw.replace(/\r\n?/g, '\n');
+  if (!format.PROPERTIES_OPEN) return normalized.trim();
+  const lines = normalized.split('\n');
+  const drawer = propertyDrawerSpan(lines, format);
+  if (!drawer) return normalized.trim();
+  return [...lines.slice(0, drawer.start), ...lines.slice(drawer.end + 1)].join('\n').trim();
 }
 
 /** Count non-overlapping copies so one retained duplicate cannot mask another copy's loss. */
@@ -789,7 +961,8 @@ export async function retireSpec(
     beforeMutate?: () => Promise<void>;
     verifyDisplaced?: (displacedPath: string) => Promise<void>;
     deferDelete?: boolean;
-  } = {}
+  } = {},
+  format: ResolvedFormat = defaultFormat()
 ): Promise<{ retired: boolean; resolvedPath?: string; displacedPath?: string }> {
   if (options.deferDelete && options.verifyDisplaced === undefined) {
     throw new Error('Deferred retirement requires displaced-file verification.');
@@ -877,7 +1050,7 @@ export async function retireSpec(
     await pruneEmptyDirs(path.dirname(update.target), mainSpecsDir);
   }
 
-  const nominal = options.displayPath ?? `openspec/specs/${update.id}/spec.md`;
+  const nominal = options.displayPath ?? `openspec/specs/${update.id}/${format.SPEC_FILE}`;
   if (!options.silent) {
     console.log(`Retiring ${nominal}: all requirements removed.`);
   }
@@ -972,7 +1145,8 @@ export async function writeUpdatedSpec(
     silent?: boolean;
     displayPath?: string;
     beforeMutate?: () => Promise<void>;
-  } = {}
+  } = {},
+  format: ResolvedFormat = defaultFormat()
 ): Promise<void> {
   assertTrustedSpecPath(update.targetRoot, update.target);
 
@@ -987,7 +1161,9 @@ export async function writeUpdatedSpec(
   if (options.silent) return;
 
   const specName = update.id;
-  console.log(`Applying changes to ${options.displayPath ?? `openspec/specs/${specName}/spec.md`}:`);
+  console.log(
+    `Applying changes to ${options.displayPath ?? `openspec/specs/${specName}/${format.SPEC_FILE}`}:`
+  );
   if (counts.added) console.log(`  + ${counts.added} added`);
   if (counts.modified) console.log(`  ~ ${counts.modified} modified`);
   if (counts.removed) console.log(`  - ${counts.removed} removed`);
@@ -1012,22 +1188,25 @@ function maskHtmlComments(content: string): string {
  * inside fenced code blocks or HTML comments. Returns undefined when the
  * section is absent or its body is empty.
  */
-function extractPurposeSection(content: string): string | undefined {
+function extractPurposeSection(
+  content: string,
+  format: ResolvedFormat = defaultFormat()
+): string | undefined {
   const normalized = content.replace(/\r\n?/g, '\n');
   const lines = normalized.split('\n');
   // Structure is read from the masked copy so a commented-out or fenced
   // `## Purpose` is not mistaken for the real one; the body is returned from
   // the original lines so an author's own comments and fences survive intact.
   const masked = maskHtmlComments(normalized).split('\n');
-  const fenceMask = buildCodeFenceMask(masked);
+  const fenceMask = buildStructureMask(masked, format);
   const isStructural = (i: number) => !fenceMask[i];
 
-  const start = masked.findIndex((line, i) => isStructural(i) && /^##\s+Purpose\s*$/i.test(line));
+  const start = masked.findIndex((line, i) => isStructural(i) && format.H2_PURPOSE.test(line));
   if (start === -1) return undefined;
 
   let end = masked.length;
   for (let i = start + 1; i < masked.length; i++) {
-    if (isStructural(i) && /^##\s+/.test(masked[i])) {
+    if (isStructural(i) && format.H2_ANY.test(masked[i])) {
       end = i;
       break;
     }
@@ -1054,7 +1233,11 @@ function extractPurposeSection(content: string): string | undefined {
  * Returns the parsed overview rather than a boolean so callers measure the same
  * string `validate` measures, not the raw slice out of the delta.
  */
-function readableOverview(skeleton: string, specName: string): string | null {
+function readableOverview(
+  skeleton: string,
+  specName: string,
+  format: ResolvedFormat = defaultFormat()
+): string | null {
   // HTML comments are invisible to the spec parsers but not to the file itself:
   // markdown hidden in one is skipped by the boundary scan yet still lands in
   // the spec, where it can hide the headers those parsers depend on and blank
@@ -1068,12 +1251,12 @@ function readableOverview(skeleton: string, specName: string): string | null {
   // nothing and renders as text - rejecting it would throw away a Purpose over
   // prose like "ingest --> transform".
   if (skeleton.includes('<!--')) return null;
-  if (findMainSpecStructureIssues(skeleton).length > 0) return null;
+  if (findMainSpecStructureIssues(skeleton, format).length > 0) return null;
   try {
     // A heading or unterminated fence in the body truncates or swallows the
     // sections around it, so archive would abort or write a spec its own
     // validator rejects.
-    return new MarkdownParser(skeleton).parseSpec(specName).overview.trim() || null;
+    return new MarkdownParser(skeleton, format).parseSpec(specName).overview.trim() || null;
   } catch {
     return null;
   }
@@ -1085,9 +1268,18 @@ function readableOverview(skeleton: string, specName: string): string | null {
  * invents the Purpose for a brand-new main spec either way, and the author's
  * own wording beats a placeholder they then have to hand-edit.
  */
-export function buildSpecSkeleton(specFolderName: string, changeName: string, purpose?: string): string {
+export function buildSpecSkeleton(
+  specFolderName: string,
+  changeName: string,
+  purpose?: string,
+  format: ResolvedFormat = defaultFormat()
+): string {
   const titleBase = specFolderName;
   const purposeBody =
     purpose?.trim() || `TBD - created by archiving change ${changeName}. Update Purpose after archive.`;
-  return `# ${titleBase} Specification\n\n## Purpose\n${purposeBody}\n\n## Requirements\n`;
+  return (
+    `${format.newSpecHeader(titleBase)}\n\n` +
+    `${format.purposeSectionLine()}\n${purposeBody}\n\n` +
+    `${format.requirementsSectionLine()}\n`
+  );
 }

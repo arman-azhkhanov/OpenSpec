@@ -3,7 +3,7 @@ import { createHash, randomUUID } from 'crypto';
 import path from 'path';
 import { formatLocalDate } from '../utils/date.js';
 import { getTaskProgressForChange, formatTaskStatus } from '../utils/task-progress.js';
-import { Validator } from './validation/validator.js';
+import { Validator, resolveSpecArtifactFormat } from './validation/validator.js';
 import { VALIDATION_MESSAGES } from './validation/constants.js';
 import chalk from 'chalk';
 import {
@@ -23,11 +23,44 @@ import {
   finalizeRetiredSpec,
   type SpecUpdate,
 } from './specs-apply.js';
+import { defaultFormat, type ResolvedFormat } from './parsers/grammar.js';
 import { discoverSpecFiles, hasAnyFileUnder } from '../utils/spec-discovery.js';
-import { METADATA_FILENAME, readRetireCapabilitiesMarker, readSkipSpecsMarker } from '../utils/change-metadata.js';
+import {
+  METADATA_FILENAME,
+  readRetireCapabilitiesMarker,
+  readSkipSpecsMarker,
+  resolveSchemaForChange,
+} from '../utils/change-metadata.js';
 import { confirmPrompt, isNonInteractivePromptError } from '../utils/interactive.js';
 import { FileSystemUtils } from '../utils/file-system.js';
 import { folderStyleNameProblem } from './id.js';
+import { resolveSchema } from './artifact-graph/index.js';
+
+/**
+ * The change's proposal file, named by the schema the change declares.
+ *
+ * The literal `proposal.md` this replaces made the proposal check below
+ * unreachable in any project whose proposal artifact is not Markdown: the
+ * `fs.access` guard failed, its catch swallowed the miss as "no proposal to
+ * validate", and the format-aware `validateChange` it guards never ran — so
+ * passing the format into that call was inert on exactly the projects the
+ * format exists for.
+ *
+ * `resolveSchema` throws on an unresolvable/misnamed schema; that is swallowed
+ * so the fallback is the classic `proposal.md`, i.e. the pre-schema behavior,
+ * and archive can never abort on this lookup.
+ */
+function resolveProposalPath(changeDir: string, projectRoot: string): string {
+  let generates = 'proposal.md';
+  try {
+    const schemaName = resolveSchemaForChange(changeDir, undefined, projectRoot);
+    const schema = resolveSchema(schemaName, projectRoot);
+    generates = schema.artifacts.find((a) => a.id === 'proposal')?.generates ?? generates;
+  } catch {
+    // Schema unreadable: keep the classic filename rather than fail the archive.
+  }
+  return path.join(changeDir, generates);
+}
 
 function isMissingPathError(error: unknown): boolean {
   return (
@@ -58,8 +91,12 @@ const ARCHIVE_DATE_PREFIX_PATTERN = /^\d{4}-\d{2}-\d{2}-/;
  * parser only indexes canonical `### Requirement:` headers and sweeps the rest
  * into the preamble, which survives into the rebuilt spec.
  */
-export async function isRetirableSpec(specName: string, rebuilt: string): Promise<boolean> {
-  const report = await new Validator().validateSpecContent(specName, rebuilt);
+export async function isRetirableSpec(
+  specName: string,
+  rebuilt: string,
+  format: ResolvedFormat = defaultFormat()
+): Promise<boolean> {
+  const report = await new Validator().validateSpecContent(specName, rebuilt, format);
   if (report.valid) return false;
   const errors = report.issues.filter((issue) => issue.level === 'ERROR');
   return (
@@ -81,13 +118,14 @@ async function isRetirementCandidate(
     Awaited<ReturnType<typeof buildUpdatedSpec>>,
     'rebuilt' | 'noRequirementBlocks' | 'unaccountedContent'
   >,
-  skipValidation: boolean
+  skipValidation: boolean,
+  format: ResolvedFormat = defaultFormat()
 ): Promise<boolean> {
   return (
     !skipValidation &&
     built.noRequirementBlocks &&
     built.unaccountedContent.length === 0 &&
-    (await isRetirableSpec(update.id, built.rebuilt))
+    (await isRetirableSpec(update.id, built.rebuilt, format))
   );
 }
 
@@ -95,7 +133,8 @@ async function decideSpecOutcome(
   update: SpecUpdate,
   built: Awaited<ReturnType<typeof buildUpdatedSpec>>,
   skipValidation: boolean,
-  retirementDeclared: boolean
+  retirementDeclared: boolean,
+  format: ResolvedFormat = defaultFormat()
 ): Promise<SpecOutcome> {
   // The author has to have asked. Without the marker this falls through to the
   // ordinary write, which fails validation exactly as it always did - and the
@@ -119,7 +158,7 @@ async function decideSpecOutcome(
   // as "did anything land outside the parts I understand" rather than "does
   // anything look like a requirement" - the second question is the one six
   // review rounds each found a new way to answer wrongly.
-  const retirable = await isRetirementCandidate(update, built, skipValidation);
+  const retirable = await isRetirementCandidate(update, built, skipValidation, format);
 
   if (!retirable) return 'write';
   // Nothing on disk to write or retire: the capability is already retired.
@@ -1124,6 +1163,12 @@ export class ArchiveCommand {
     }
 
     const changeDir = path.join(changesDir, changeName);
+    // Resolved once, from the schema this change declares, and then carried
+    // through every read, write and message below: a run that read the deltas
+    // in one format and reported them in another would name headers the author
+    // cannot find. A change with no schema, or one that cannot be read, gets
+    // the built-in Markdown defaults, so this cannot introduce a new abort.
+    const format = resolveSpecArtifactFormat(root.path, changeDir);
 
     // Verify change exists
     try {
@@ -1157,10 +1202,10 @@ export class ArchiveCommand {
 
       // Validate proposal.md (informative only; human mode prints warnings)
       if (!json) {
-        const changeFile = path.join(changeDir, 'proposal.md');
+        const changeFile = resolveProposalPath(changeDir, root.path);
         try {
           await fs.access(changeFile);
-          const changeReport = await validator.validateChange(changeFile);
+          const changeReport = await validator.validateChange(changeFile, format);
           // Proposal validation is informative only (do not block archive).
           // `validateChange` parses the change together with its delta specs,
           // so it also raises requirement-level issues under
@@ -1176,7 +1221,9 @@ export class ArchiveCommand {
             (issue) => !/^deltas\.\d+\.requirements?\./.test(issue.path)
           );
           if (!changeReport.valid && proposalIssues.length > 0) {
-            console.log(chalk.yellow(`\nProposal warnings in proposal.md (non-blocking):`));
+            console.log(
+              chalk.yellow(`\nProposal warnings in ${path.basename(changeFile)} (non-blocking):`)
+            );
             for (const issue of proposalIssues) {
               const symbol = issue.level === 'ERROR' ? '⚠' : (issue.level === 'WARNING' ? '⚠' : 'ℹ');
               console.log(chalk.yellow(`  ${symbol} ${issue.message}`));
@@ -1194,7 +1241,9 @@ export class ArchiveCommand {
       // (#1385). Its existence alone must run validation, which reports it and
       // blocks the archive. A directory named spec.md is a normal capability
       // folder, so only a regular file counts.
-      const rootSpecStat = await fs.stat(path.join(changeSpecsDir, 'spec.md')).catch(() => null);
+      const rootSpecStat = await fs
+        .stat(path.join(changeSpecsDir, format.SPEC_FILE))
+        .catch(() => null);
       let hasDeltaSpecs = rootSpecStat?.isFile() === true;
       // A change that declares skip_specs must not carry any file under
       // specs/ — validate reports that as a conflict, so archive has to run
@@ -1221,12 +1270,14 @@ export class ArchiveCommand {
           hasDeltaSpecs = specsDirHasFiles;
         }
       }
-      for (const { specFile } of hasDeltaSpecs ? [] : await discoverSpecFiles(changeSpecsDir)) {
+      for (const { specFile } of hasDeltaSpecs
+        ? []
+        : await discoverSpecFiles(changeSpecsDir, format)) {
         try {
           const content = await fs.readFile(specFile, 'utf-8');
           // Case-insensitive to match the delta parser, so a lowercase header
           // routes through the same delta validation that validate runs.
-          if (/^##\s+(ADDED|MODIFIED|REMOVED|RENAMED)\s+Requirements/im.test(content)) {
+          if (format.H2_DELTA_LOOSE.test(content)) {
             hasDeltaSpecs = true;
             break;
           }
@@ -1236,7 +1287,7 @@ export class ArchiveCommand {
         // No mainSpecsDir here on purpose: the scenario-loss check standalone
         // validate runs (#1477) is the same one buildUpdatedSpec enforces a few
         // steps later, and reporting it here would relabel that failure.
-        const deltaReport = await validator.validateChangeDeltaSpecs(changeDir);
+        const deltaReport = await validator.validateChangeDeltaSpecs(changeDir, { format });
         if (!deltaReport.valid) {
           hasValidationErrors = true;
           if (!json) {
@@ -1381,7 +1432,7 @@ export class ArchiveCommand {
       }
     } else {
       // Find specs to update
-      const specUpdates = await findSpecUpdates(changeDir, mainSpecsDir);
+      const specUpdates = await findSpecUpdates(changeDir, mainSpecsDir, format);
 
       if (specUpdates.length > 0) {
         if (!json) {
@@ -1413,7 +1464,7 @@ export class ArchiveCommand {
           for (const update of specUpdates) {
             const sourceBeforeBuild = await fingerprintPath(update.source);
             const targetBeforeBuild = await fingerprintPath(update.target);
-            const built = await buildUpdatedSpec(update, changeName!, { silent: true });
+            const built = await buildUpdatedSpec(update, changeName!, { silent: true }, format);
             const sourceAfterBuild = await fingerprintPath(update.source);
             const targetAfterBuild = await fingerprintPath(update.target);
             if (
@@ -1432,7 +1483,8 @@ export class ArchiveCommand {
                 update,
                 built,
                 skipValidation,
-                retirementDeclared
+                retirementDeclared,
+                format
               ),
               noRequirementBlocks: built.noRequirementBlocks,
               unaccountedContent: built.unaccountedContent,
@@ -1496,7 +1548,7 @@ export class ArchiveCommand {
                   `The ${METADATA_FILENAME} retirement authorization changed while archive was awaiting confirmation.`
                 );
               }
-              const currentUpdates = await findSpecUpdates(changeDir, mainSpecsDir);
+              const currentUpdates = await findSpecUpdates(changeDir, mainSpecsDir, format);
               const currentById = new Map(currentUpdates.map((update) => [update.id, update]));
               if (currentUpdates.length !== prepared.length) {
                 throw new Error('The change specs changed while archive was awaiting confirmation.');
@@ -1517,12 +1569,13 @@ export class ArchiveCommand {
                       'No files were changed; review the new content and rerun.'
                   );
                 }
-                const rebuilt = await buildUpdatedSpec(current, changeName!, { silent: true });
+                const rebuilt = await buildUpdatedSpec(current, changeName!, { silent: true }, format);
                 const outcome = await decideSpecOutcome(
                   current,
                   rebuilt,
                   skipValidation,
-                  retirementDeclared
+                  retirementDeclared,
+                  format
                 );
                 if (
                   current.exists !== proposed.update.exists ||
@@ -1566,7 +1619,7 @@ export class ArchiveCommand {
               // so re-reporting that one error would just abort the fix (#1302).
               if (p.outcome !== 'write') continue;
               const specName = p.update.id;
-              const report = await new Validator().validateSpecContent(specName, p.rebuilt);
+              const report = await new Validator().validateSpecContent(specName, p.rebuilt, format);
               if (!report.valid) {
                 // The dead end #1302 describes: the rebuilt spec is unwritable
                 // for exactly one reason, and retiring the capability is the
@@ -1578,7 +1631,7 @@ export class ArchiveCommand {
                   !retirementDeclared &&
                   p.update.exists &&
                   p.counts.removed > 0 &&
-                  (await isRetirementCandidate(p.update, p, false));
+                  (await isRetirementCandidate(p.update, p, false, format));
                 const retirementHint = retirementWouldFix
                   ? `This change removes the last requirement '${specName}' has. To retire the` +
                     ` capability and delete its spec, add \`retire_capabilities: true\` to the` +
@@ -1597,12 +1650,12 @@ export class ArchiveCommand {
                 const refusalReason =
                   retirementDeclared &&
                   p.unaccountedContent.length > 0 &&
-                  (await isRetirableSpec(specName, p.rebuilt))
+                  (await isRetirableSpec(specName, p.rebuilt, format))
                     ? `'${specName}' declares retire_capabilities, but the spec holds content the merge ` +
                       `cannot safely account for and deleting the file would take with it: ` +
                       `${p.unaccountedContent.slice(0, 3).map((line) => `"${line}"`).join(', ')}` +
                       `${p.unaccountedContent.length > 3 ? `, and ${p.unaccountedContent.length - 3} more line(s)` : ''}. ` +
-                      'Move it into `## Purpose` or a canonical requirement, or delete the spec by hand.'
+                      `Move it into \`${format.purposeSectionLine()}\` or a canonical requirement, or delete the spec by hand.`
                     : undefined;
                 if (json) {
                   throw new ArchiveBlockedError(
@@ -1678,22 +1731,28 @@ export class ArchiveCommand {
               // only churn normalization differences into it.
               continue;
             }
-            await writeUpdatedSpec(p.update, p.rebuilt, p.counts, {
-              silent: json,
-              beforeMutate: async () => {
-                if (
-                  (await fingerprintSpecInputs(p.update)) !==
-                  `${p.sourceFingerprint}\n${p.targetFingerprint}`
-                ) {
-                  throw new Error(
-                    `Spec inputs for '${p.update.id}' changed before archive could write them.`
-                  );
-                }
-                mutationAttempts.add(p.update.target);
+            await writeUpdatedSpec(
+              p.update,
+              p.rebuilt,
+              p.counts,
+              {
+                silent: json,
+                beforeMutate: async () => {
+                  if (
+                    (await fingerprintSpecInputs(p.update)) !==
+                    `${p.sourceFingerprint}\n${p.targetFingerprint}`
+                  ) {
+                    throw new Error(
+                      `Spec inputs for '${p.update.id}' changed before archive could write them.`
+                    );
+                  }
+                  mutationAttempts.add(p.update.target);
+                },
+                // Cross-root paths must be absolute when a store is selected.
+                ...(isStoreSelectedRoot(root) ? { displayPath: p.update.target } : {}),
               },
-              // Cross-root paths must be absolute when a store is selected.
-              ...(isStoreSelectedRoot(root) ? { displayPath: p.update.target } : {}),
-            });
+              format
+            );
             wroteAny = true;
             writeTotals.added += added;
             writeTotals.modified += modified;
@@ -1746,7 +1805,8 @@ export class ArchiveCommand {
                   }
                 },
                 ...(isStoreSelectedRoot(root) ? { displayPath: p.update.target } : {}),
-              }
+              },
+              format
             );
             if (!retired) continue;
             const retirementSnapshot = specSnapshotsByTarget.get(p.update.target);
