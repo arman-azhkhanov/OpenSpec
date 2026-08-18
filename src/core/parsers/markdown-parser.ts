@@ -1,7 +1,13 @@
 import { Spec, Change, Requirement, Scenario, Delta, DeltaOperation } from '../schemas/index.js';
-import { buildCodeFenceMask, extractRequirementText } from './requirement-text.js';
+import { extractRequirementText } from './requirement-text.js';
+import { buildStructureMask } from './code-fence.js';
+import { defaultFormat, type ResolvedFormat } from './grammar.js';
 
 export interface Section {
+  /**
+   * Section depth in Markdown numbering (`## ` is 2), whatever the format
+   * writes it as, so a consumer comparing depths never has to know the markup.
+   */
   level: number;
   title: string;
   content: string;
@@ -12,11 +18,13 @@ export class MarkdownParser {
   private lines: string[];
   private codeFenceLineMask: boolean[];
   private currentLine: number;
+  protected format: ResolvedFormat;
 
-  constructor(content: string) {
+  constructor(content: string, format: ResolvedFormat = defaultFormat()) {
     const normalized = MarkdownParser.normalizeContent(content);
+    this.format = format;
     this.lines = normalized.split('\n');
-    this.codeFenceLineMask = buildCodeFenceMask(this.lines);
+    this.codeFenceLineMask = buildStructureMask(this.lines, format);
     this.currentLine = 0;
   }
 
@@ -25,12 +33,19 @@ export class MarkdownParser {
     return content.replace(/^﻿/, '').replace(/\r\n?/g, '\n');
   }
 
+  /** A section heading's title: the token line without its heading marker. */
+  protected sectionTitle(headingLine: string): string {
+    return headingLine.replace(this.format.HEADING_PREFIX, '').trim();
+  }
+
   parseSpec(name: string): Spec {
     const sections = this.parseSections();
-    const purpose = this.findSection(sections, 'Purpose')?.content || '';
-    
-    const requirementsSection = this.findSection(sections, 'Requirements');
-    
+    const purposeTitle = this.sectionTitle(this.format.purposeSectionLine());
+    const requirementsTitle = this.sectionTitle(this.format.requirementsSectionLine());
+    const purpose = this.findSection(sections, purposeTitle)?.content || '';
+
+    const requirementsSection = this.findSection(sections, requirementsTitle);
+
     if (!purpose) {
       throw new Error('Spec must have a Purpose section');
     }
@@ -88,10 +103,10 @@ export class MarkdownParser {
       if (this.codeFenceLineMask[i]) {
         continue;
       }
-      const headerMatch = line.match(/^(#{1,6})\s+(.+)$/);
-      
+      const headerMatch = line.match(this.format.HEADING_ANY);
+
       if (headerMatch) {
-        const level = headerMatch[1].length;
+        const level = this.format.headingLevel(line)!;
         const title = headerMatch[2].trim();
         const content = this.getContentUntilNextHeader(i + 1, level);
         
@@ -124,9 +139,9 @@ export class MarkdownParser {
     
     for (let i = startLine; i < this.lines.length; i++) {
       const line = this.lines[i];
-      const headerMatch = this.codeFenceLineMask[i] ? null : line.match(/^(#{1,6})\s+/);
-      
-      if (headerMatch && headerMatch[1].length <= currentLevel) {
+      const level = this.codeFenceLineMask[i] ? null : this.format.headingLevel(line);
+
+      if (level !== null && level <= currentLevel) {
         break;
       }
       
@@ -155,7 +170,7 @@ export class MarkdownParser {
     for (const child of section.children) {
       // Read the requirement text via the shared reader (multi-line, fence- and
       // metadata-aware, with the shared header-title fallback for empty bodies).
-      const text = extractRequirementText(child.title, child.content.split('\n'));
+      const text = extractRequirementText(child.title, child.content.split('\n'), this.format);
 
       const scenarios = this.parseScenarios(child);
 
@@ -189,8 +204,8 @@ export class MarkdownParser {
     const lines = content.split('\n');
     
     for (const line of lines) {
-      // Match both formats: **spec:** and **spec**:
-      const deltaMatch = line.match(/^\s*-\s*\*\*([^*:]+)(?::\*\*|\*\*:)\s*(.+)$/);
+      // Match both label spellings: `**spec:**` and `**spec**:`
+      const deltaMatch = line.match(this.format.DELTA_BULLET);
       if (deltaMatch) {
         const specName = deltaMatch[1].trim();
         const description = deltaMatch[2].trim();

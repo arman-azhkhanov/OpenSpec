@@ -1,7 +1,8 @@
 import ora from 'ora';
 import path from 'path';
-import { Validator } from '../core/validation/validator.js';
+import { Validator, resolveSpecArtifactFormat } from '../core/validation/validator.js';
 import { VALIDATION_MESSAGES } from '../core/validation/constants.js';
+import { deltaHeaders, scenarioLabel, type ResolvedFormat } from '../core/parsers/grammar.js';
 import {
   resolveRootForCommand,
   toRootOutput,
@@ -216,26 +217,31 @@ export class ValidateCommand {
     const validator = new Validator(opts.strict);
     if (type === 'change') {
       const changeDir = path.join(root.changesDir, id);
+      const changeFormat = resolveSpecArtifactFormat(root.path, changeDir);
       const start = Date.now();
       const report = await validator.validateChangeDeltaSpecs(changeDir, {
         mainSpecsDir: root.specsDir,
         projectRoot: root.path,
+        format: changeFormat,
       });
       const durationMs = Date.now() - start;
-      this.printReport('change', id, report, durationMs, opts.json, root);
+      this.printReport('change', id, report, durationMs, opts.json, root, changeFormat);
       // Non-zero exit if invalid (keeps enriched output test semantics)
       process.exitCode = report.valid ? 0 : 1;
       return;
     }
-    const file = path.join(root.specsDir, id, 'spec.md');
+    // A main spec belongs to the project, not to a change, so its format comes
+    // from the project's own schema.
+    const format = resolveSpecArtifactFormat(root.path);
+    const file = path.join(root.specsDir, id, format.SPEC_FILE);
     const start = Date.now();
-    const report = await validator.validateSpec(file);
+    const report = await validator.validateSpec(file, format);
     const durationMs = Date.now() - start;
-    this.printReport('spec', id, report, durationMs, opts.json, root);
+    this.printReport('spec', id, report, durationMs, opts.json, root, format);
     process.exitCode = report.valid ? 0 : 1;
   }
 
-  private printReport(type: ItemType, id: string, report: { valid: boolean; issues: any[] }, durationMs: number, json: boolean, root: ResolvedOpenSpecRoot): void {
+  private printReport(type: ItemType, id: string, report: { valid: boolean; issues: any[] }, durationMs: number, json: boolean, root: ResolvedOpenSpecRoot, format: ResolvedFormat): void {
     if (json) {
       const out = { items: [{ id, type, valid: report.valid, issues: report.issues, durationMs }], summary: { totals: { items: 1, passed: report.valid ? 1 : 0, failed: report.valid ? 0 : 1 }, byType: { [type]: { items: 1, passed: report.valid ? 1 : 0, failed: report.valid ? 0 : 1 } } }, version: '1.0', root: toRootOutput(root) };
       console.log(JSON.stringify(out, null, 2));
@@ -250,11 +256,11 @@ export class ValidateCommand {
         const prefix = issue.level === 'ERROR' ? '✗' : issue.level === 'WARNING' ? '⚠' : 'ℹ';
         console.error(`${prefix} [${label}] ${issue.path}: ${issue.message}`);
       }
-      this.printNextSteps(type, id, root, report.issues);
+      this.printNextSteps(type, id, root, format, report.issues);
     }
   }
 
-  private printNextSteps(type: ItemType, id: string, root: ResolvedOpenSpecRoot, issues: Array<{ message: string }> = []): void {
+  private printNextSteps(type: ItemType, id: string, root: ResolvedOpenSpecRoot, format: ResolvedFormat, issues: Array<{ message: string }> = []): void {
     const bullets: string[] = [];
     // The delta-authoring bullets contradict a marker-related error ("add
     // deltas" vs "remove skip_specs or the files"), so branch on the exact
@@ -273,12 +279,12 @@ export class ValidateCommand {
       bullets.push('- Fix .openspec.yaml so the skip_specs marker can be honored (schema: <name> naming a known schema is required)');
       bullets.push('- Or remove skip_specs from .openspec.yaml and add delta specs instead');
     } else if (type === 'change') {
-      bullets.push('- Ensure change has deltas in specs/: use headers ## ADDED/MODIFIED/REMOVED/RENAMED Requirements');
-      bullets.push('- Each requirement MUST include at least one #### Scenario: block');
+      bullets.push(`- Ensure change has deltas in specs/: use headers ${deltaHeaders(format)}`);
+      bullets.push(`- Each requirement MUST include at least one ${scenarioLabel(format)} block`);
       bullets.push(`- Debug parsed deltas: ${withStoreFlag(root, `openspec show ${id} --json --deltas-only`)}`);
     } else {
-      bullets.push('- Ensure spec includes ## Purpose and ## Requirements sections');
-      bullets.push('- Each requirement MUST include at least one #### Scenario: block');
+      bullets.push(`- Ensure spec includes ${format.purposeSectionLine()} and ${format.requirementsSectionLine()} sections`);
+      bullets.push(`- Each requirement MUST include at least one ${scenarioLabel(format)} block`);
       bullets.push('- Re-run with --json to see structured report');
     }
     console.error('Next steps:');
@@ -298,6 +304,10 @@ export class ValidateCommand {
     const validator = new Validator(opts.strict);
     const queue: Array<() => Promise<BulkItemResult>> = [];
 
+    // Resolved once per run: every main spec in a root shares the project's
+    // schema, and a change's own schema is resolved per change below.
+    const projectFormat: ResolvedFormat = resolveSpecArtifactFormat(root.path);
+
     for (const id of changeIds) {
       queue.push(async () => {
         const start = Date.now();
@@ -305,6 +315,7 @@ export class ValidateCommand {
         const report = await validator.validateChangeDeltaSpecs(changeDir, {
           mainSpecsDir: root.specsDir,
           projectRoot: root.path,
+          format: resolveSpecArtifactFormat(root.path, changeDir),
         });
         const durationMs = Date.now() - start;
         return { id, type: 'change' as const, valid: report.valid, issues: report.issues, durationMs };
@@ -313,8 +324,8 @@ export class ValidateCommand {
     for (const id of specIds) {
       queue.push(async () => {
         const start = Date.now();
-        const file = path.join(root.specsDir, id, 'spec.md');
-        const report = await validator.validateSpec(file);
+        const file = path.join(root.specsDir, id, projectFormat.SPEC_FILE);
+        const report = await validator.validateSpec(file, projectFormat);
         const durationMs = Date.now() - start;
         return { id, type: 'spec' as const, valid: report.valid, issues: report.issues, durationMs };
       });

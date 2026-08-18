@@ -1,4 +1,5 @@
 import { parseTaskLines } from '../../utils/task-progress.js';
+import { defaultFormat, type ResolvedFormat } from '../parsers/grammar.js';
 
 export interface TaskNumberingDocument {
   path: string;
@@ -16,34 +17,36 @@ interface TaskLocation {
   line: number;
 }
 
-const LEVEL_TWO_HEADING = /^ {0,3}##(?!#)(?:[ \t]+|[ \t]*\r?$)/;
-const NUMBERED_GROUP_HEADING = /^ {0,3}##[ \t]+(\d+)\.(?:[ \t]|\r?$)/;
 const TASK_ID = /^(\d+(?:\.\d+)+(?:[A-Za-z]+)?)(?=\s|$)/;
 
 /**
  * Finds ambiguous task references across the task files tracked by a change.
- * Numbering is interpreted only inside `## N.` groups. Unnumbered sections,
- * unnumbered tasks, and files without numbered groups are intentionally ignored.
+ * Numbering is interpreted only inside numbered top-level groups (`## N.` in
+ * Markdown). Unnumbered sections, unnumbered tasks, and files without numbered
+ * groups are intentionally ignored. The group heading and the task line are
+ * recognized through the format the task files are written in, so a change
+ * whose tasks artifact declares another markup is linted, not skipped.
  */
 export function findTaskNumberingIssues(
-  documents: readonly TaskNumberingDocument[]
+  documents: readonly TaskNumberingDocument[],
+  format: ResolvedFormat = defaultFormat()
 ): TaskNumberingIssue[] {
   const issues: TaskNumberingIssue[] = [];
   const firstLocationById = new Map<string, TaskLocation>();
 
   for (const document of documents) {
     const lines = document.content.split('\n');
-    if (!lines.some((line) => NUMBERED_GROUP_HEADING.test(line))) continue;
+    if (!lines.some((line) => format.NUMBERED_GROUP_HEADING.test(line))) continue;
 
     let currentGroup: string | undefined;
 
     lines.forEach((line, index) => {
-      if (LEVEL_TWO_HEADING.test(line)) {
-        currentGroup = line.match(NUMBERED_GROUP_HEADING)?.[1];
+      if (format.LEVEL_TWO_HEADING.test(line)) {
+        currentGroup = line.match(format.NUMBERED_GROUP_HEADING)?.[1];
       }
       if (currentGroup === undefined) return;
 
-      const task = parseTaskLines(line)[0];
+      const task = parseTaskLines(line, format)[0];
       const id = task?.description.match(TASK_ID)?.[1];
       if (!id) return;
 

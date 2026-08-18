@@ -2,25 +2,9 @@ import { promises as fs } from 'fs';
 import path from 'path';
 import type { Artifact, SchemaYaml } from '../core/artifact-graph/index.js';
 import { resolveArtifactOutputs, resolveSchema } from '../core/artifact-graph/index.js';
+import { defaultFormat, resolveFormat, type ResolvedFormat } from '../core/parsers/grammar.js';
+import type { ProjectConfig } from '../core/project-config.js';
 import { resolveSchemaForChange } from './change-metadata.js';
-
-/**
- * A Markdown task line: a `-`/`*` bullet carrying a `[ ]` or `[x]` checkbox.
- *
- * Leading whitespace is allowed so nested sub-tasks count like their parents.
- * Anchoring at column 0 made `  - [ ] 1.1.1 ...` invisible to progress, to the
- * apply task list, and to archive's incomplete-task check, so a change with
- * unfinished sub-tasks reported "✓ Complete" and archived without a warning.
- *
- * Permissive on purpose, and safe to keep that way: any character class
- * tightened here - the `\s` inside the brackets, which lets a tab or
- * non-breaking space stand for an empty box - drops lines that used to count,
- * and a task this parser drops is a task `openspec archive` stops warning about.
- *
- * Deliberately unanchored at the end: `.` does not match `\r`, so writing the
- * description group as `(.*)$` would reject every line of a CRLF tasks.md.
- */
-const TASK_LINE_PATTERN = /^\s*[-*]\s*\[([\sxX])\]\s*(.*)/;
 
 export interface ParsedTask {
   /** Checkbox state: `[x]`/`[X]` is done, anything else is not. */
@@ -32,18 +16,32 @@ export interface ParsedTask {
 /**
  * Parses every task line in a tasks file, in document order.
  *
+ * A task line is a bullet carrying a checkbox; which bullet characters and
+ * which in-box marks count is the format's business (`format.TASK_LINE`). The
+ * Markdown default is the pattern this function carried before the format
+ * parameter existed, so an unresolved caller counts exactly what it counted
+ * before. Org additionally accepts `[-]`, its own "started, not done" mark,
+ * which is a task and therefore belongs in the denominator.
+ *
+ * The recognizer stays permissive on purpose: any character class tightened
+ * here drops lines that used to count, and a task this parser drops is a task
+ * `openspec archive` stops warning about.
+ *
  * Every line matching the pattern counts, wherever it sits - inside a code
  * fence, an HTML comment or an indented block, as before. Skipping fenced
  * checkboxes was tried and dropped: every rule for deciding which fence is
- * "real" has an input where a stray or unbalanced ``` swallows genuine tasks.
+ * "real" has an input where a stray or unbalanced fence swallows genuine tasks.
  * Counting a documented example as work is a loud, bypassable false positive;
  * losing a real task is a silent one.
  */
-export function parseTaskLines(content: string): ParsedTask[] {
+export function parseTaskLines(
+  content: string,
+  format: ResolvedFormat = defaultFormat()
+): ParsedTask[] {
   const tasks: ParsedTask[] = [];
 
   for (const line of content.split('\n')) {
-    const match = line.match(TASK_LINE_PATTERN);
+    const match = line.match(format.TASK_LINE);
     if (match) {
       tasks.push({ done: match[1].toLowerCase() === 'x', description: match[2].trim() });
     }
@@ -57,8 +55,11 @@ export interface TaskProgress {
   completed: number;
 }
 
-export function countTasksFromContent(content: string): TaskProgress {
-  const tasks = parseTaskLines(content);
+export function countTasksFromContent(
+  content: string,
+  format: ResolvedFormat = defaultFormat()
+): TaskProgress {
+  const tasks = parseTaskLines(content, format);
   return {
     total: tasks.length,
     completed: tasks.filter((task) => task.done).length,
@@ -79,6 +80,14 @@ function findTrackedTasksArtifact(schema: SchemaYaml): Artifact | undefined {
   return schema.artifacts.find((a) => a.id === 'tasks');
 }
 
+/** What one schema contributes to counting a change's tasks. */
+interface TrackedTasks {
+  /** The tracked-tasks artifact's output glob, when there is one. */
+  generates: string | undefined;
+  /** The format that artifact's content is written in. */
+  format: ResolvedFormat;
+}
+
 /**
  * Run-scoped memo mapping a schema name to its tracked-tasks `generates` glob.
  * When one command resolves progress for many changes under a constant
@@ -90,27 +99,91 @@ function findTrackedTasksArtifact(schema: SchemaYaml): Artifact | undefined {
 export type SchemaGlobCache = Map<string, string | undefined>;
 
 /**
- * Resolves the tracked-tasks artifact's output glob for a change, or undefined
- * when the schema cannot be resolved or no tracked-tasks artifact exists.
- * `resolveSchema` throws on an unresolvable/misnamed schema; we swallow that so
- * the caller falls back to a single top-level `tasks.md` and never crashes.
- * A `schemaGlobCache`, when supplied, memoizes the schema-name → glob lookup for
- * the duration of one run.
+ * The formats that accompany a caller's glob cache, keyed by the cache object
+ * itself.
+ *
+ * A side table rather than a richer cache value: the glob cache's value type is
+ * part of what callers observe, and both halves must be memoized together or
+ * the schema would be re-parsed per change to recover the half that was not.
+ * Keying on the cache makes the memo exactly as long-lived as the run that owns
+ * it.
  */
-function resolveTrackedTasksGlob(
+const formatsByGlobCache = new WeakMap<SchemaGlobCache, Map<string, ResolvedFormat>>();
+
+const NO_TRACKED_TASKS: TrackedTasks = { generates: undefined, format: defaultFormat() };
+
+/**
+ * What a caller that has already resolved the change's schema — or already read
+ * the project config — hands the resolver so neither is read a second time.
+ *
+ * Not an optimization: `readProjectConfig` reports a malformed `operations:`
+ * block on every read, and the CLI's contract is one warning per command. A
+ * command that resolved the schema once and then let this resolver resolve it
+ * again printed that warning twice
+ * (`artifact-workflow.test.ts` "emits one warning per command"). Upstream keeps
+ * no config cache on purpose (`project-config.ts`: "changes are reflected
+ * immediately without stale cache issues"), so the already-read value has to
+ * travel by parameter.
+ */
+export interface TrackedTasksOptions {
+  /**
+   * The schema name the caller already resolved for this change. Supplying it
+   * skips schema-name resolution entirely, so the tasks format is the format of
+   * the very schema the rest of the command is using — including when the CLI
+   * overrode it with `--schema`.
+   */
+  schemaName?: string;
+  /**
+   * Pre-read project config, forwarded to `resolveSchemaForChange`, which
+   * suppresses its fallback config read only when this is not `undefined`.
+   * Passing `undefined` therefore preserves the previous read-it-myself
+   * behavior exactly.
+   */
+  projectConfig?: ProjectConfig | null;
+}
+
+/**
+ * Resolves the tracked-tasks artifact's output glob and format for a change.
+ * `resolveSchema` throws on an unresolvable/misnamed schema; we swallow that so
+ * the caller falls back to a single top-level `tasks.md`, counted with the
+ * default format, and never crashes. A `schemaGlobCache`, when supplied,
+ * memoizes the schema-name lookup for the duration of one run.
+ */
+function resolveTrackedTasks(
   changeDir: string,
   projectRoot: string,
-  schemaGlobCache?: SchemaGlobCache
-): string | undefined {
+  schemaGlobCache?: SchemaGlobCache,
+  options: TrackedTasksOptions = {}
+): TrackedTasks {
   try {
-    const schemaName = resolveSchemaForChange(changeDir, undefined, projectRoot);
-    if (schemaGlobCache?.has(schemaName)) return schemaGlobCache.get(schemaName);
+    const schemaName =
+      options.schemaName ??
+      resolveSchemaForChange(changeDir, undefined, projectRoot, {
+        projectConfig: options.projectConfig,
+      });
+    let formats: Map<string, ResolvedFormat> | undefined;
+    if (schemaGlobCache) {
+      formats = formatsByGlobCache.get(schemaGlobCache);
+      if (!formats) {
+        formats = new Map();
+        formatsByGlobCache.set(schemaGlobCache, formats);
+      }
+      const format = formats.get(schemaName);
+      if (format && schemaGlobCache.has(schemaName)) {
+        return { generates: schemaGlobCache.get(schemaName), format };
+      }
+    }
     const schema = resolveSchema(schemaName, projectRoot);
-    const generates = findTrackedTasksArtifact(schema)?.generates;
-    schemaGlobCache?.set(schemaName, generates);
-    return generates;
+    const artifact = findTrackedTasksArtifact(schema);
+    const tracked: TrackedTasks = {
+      generates: artifact?.generates,
+      format: resolveFormat(artifact),
+    };
+    schemaGlobCache?.set(schemaName, tracked.generates);
+    formats?.set(schemaName, tracked.format);
+    return tracked;
   } catch {
-    return undefined;
+    return NO_TRACKED_TASKS;
   }
 }
 
@@ -120,8 +193,23 @@ export function resolveTaskFilesForChange(
   projectRoot: string,
   schemaGlobCache?: SchemaGlobCache
 ): string[] {
-  const generates = resolveTrackedTasksGlob(changeDir, projectRoot, schemaGlobCache);
+  const { generates } = resolveTrackedTasks(changeDir, projectRoot, schemaGlobCache);
   return generates ? resolveArtifactOutputs(changeDir, generates) : [];
+}
+
+/**
+ * The format a change's task files are written in — the tracked-tasks
+ * artifact's, defaulting to Markdown when the schema declares none. Exposed so
+ * a caller that reads those files itself (task-numbering via `validate`) reads
+ * them the same way the counter does.
+ */
+export function resolveTaskFormatForChange(
+  changeDir: string,
+  projectRoot: string,
+  schemaGlobCache?: SchemaGlobCache,
+  options?: TrackedTasksOptions
+): ResolvedFormat {
+  return resolveTrackedTasks(changeDir, projectRoot, schemaGlobCache, options).format;
 }
 
 export interface TaskProgressDetail extends TaskProgress {
@@ -142,10 +230,14 @@ export interface TaskProgressDetail extends TaskProgress {
  * ENOTDIR) is recorded in `unreadable` so a caller can surface it; the count
  * still contributes zero, so existing callers see no change.
  */
-async function countTaskFile(file: string, unreadable: string[]): Promise<TaskProgress> {
+async function countTaskFile(
+  file: string,
+  unreadable: string[],
+  format: ResolvedFormat
+): Promise<TaskProgress> {
   try {
     const content = await fs.readFile(file, 'utf-8');
-    return countTasksFromContent(content);
+    return countTasksFromContent(content, format);
   } catch (error: any) {
     if (error?.code !== 'ENOENT') unreadable.push(file);
     return { total: 0, completed: 0 };
@@ -172,13 +264,17 @@ export async function getTaskProgressDetailForChange(
   schemaGlobCache?: SchemaGlobCache
 ): Promise<TaskProgressDetail> {
   const changeDir = path.join(changesDir, changeName);
-  const files = resolveTaskFilesForChange(changeDir, projectRoot, schemaGlobCache);
+  const { generates, format } = resolveTrackedTasks(changeDir, projectRoot, schemaGlobCache);
+  const files = generates ? resolveArtifactOutputs(changeDir, generates) : [];
+  // `tasks.md` stays the literal fallback: `generates` is required on every
+  // artifact, so an absent glob means no tracked-tasks artifact resolved at all,
+  // and `format` is the Markdown default in exactly that case.
   const targets = files.length > 0 ? files : [path.join(changeDir, 'tasks.md')];
   const unreadable: string[] = [];
   let total = 0;
   let completed = 0;
   for (const file of targets) {
-    const progress = await countTaskFile(file, unreadable);
+    const progress = await countTaskFile(file, unreadable, format);
     total += progress.total;
     completed += progress.completed;
   }

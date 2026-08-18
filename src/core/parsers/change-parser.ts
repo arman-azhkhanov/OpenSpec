@@ -1,5 +1,6 @@
 import { MarkdownParser, Section } from './markdown-parser.js';
-import { buildCodeFenceMask } from './requirement-text.js';
+import { buildStructureMask } from './code-fence.js';
+import { defaultFormat, type ResolvedFormat } from './grammar.js';
 import { Change, Delta, DeltaOperation, Requirement } from '../schemas/index.js';
 import path from 'path';
 import { promises as fs } from 'fs';
@@ -14,9 +15,20 @@ interface DeltaSection {
 export class ChangeParser extends MarkdownParser {
   private changeDir: string;
 
-  constructor(content: string, changeDir: string) {
-    super(content);
+  /**
+   * `format` is the resolved format of the change's proposal artifact. Callers
+   * that have no schema in hand get the Markdown defaults, so their behavior is
+   * unchanged; a caller that does hold the artifact must pass it, or this
+   * reader looks for `## Why` in a document whose sections are `* Why`.
+   */
+  constructor(content: string, changeDir: string, format: ResolvedFormat = defaultFormat()) {
+    super(content, format);
     this.changeDir = changeDir;
+  }
+
+  /** A delta section's parsed title (`ADDED Requirements`), in this format. */
+  private deltaSectionTitle(operation: DeltaOperation): string {
+    return this.sectionTitle(this.format.deltaSectionLine(operation));
   }
 
   async parseChangeWithDeltas(name: string): Promise<Change> {
@@ -59,7 +71,7 @@ export class ChangeParser extends MarkdownParser {
 
     // Discover delta specs recursively so nested layouts like
     // specs/<area>/<capability>/spec.md are parsed too (#1353)
-    const specFiles = await discoverSpecFiles(specsDir);
+    const specFiles = await discoverSpecFiles(specsDir, this.format);
 
     for (const { id, specFile } of specFiles) {
       try {
@@ -88,12 +100,17 @@ export class ChangeParser extends MarkdownParser {
    *
    * Overriding here rather than in MarkdownParser keeps main spec parsing —
    * `view`, `list`, `spec --json`, spec validation — untouched.
+   *
+   * What counts as a requirement header comes from the format, not from the
+   * Markdown wording: the section titles it filters have already had their
+   * heading marker stripped, so `REQUIREMENT_TITLE` is the judgement at that
+   * level. For the built-in defaults it is the literal this filter carried.
    */
   protected parseRequirements(section: Section): Requirement[] {
     return super.parseRequirements({
       ...section,
       children: section.children.filter((child) =>
-        /^Requirement:\s*\S/i.test(child.title.trim())
+        this.format.REQUIREMENT_TITLE.test(child.title.trim())
       ),
     });
   }
@@ -103,7 +120,7 @@ export class ChangeParser extends MarkdownParser {
     const sections = this.parseSectionsFromContent(content);
     
     // Parse ADDED requirements
-    const addedSection = this.findSection(sections, 'ADDED Requirements');
+    const addedSection = this.findSection(sections, this.deltaSectionTitle('ADDED'));
     if (addedSection) {
       const requirements = this.parseRequirements(addedSection);
       requirements.forEach(req => {
@@ -119,7 +136,7 @@ export class ChangeParser extends MarkdownParser {
     }
     
     // Parse MODIFIED requirements
-    const modifiedSection = this.findSection(sections, 'MODIFIED Requirements');
+    const modifiedSection = this.findSection(sections, this.deltaSectionTitle('MODIFIED'));
     if (modifiedSection) {
       const requirements = this.parseRequirements(modifiedSection);
       requirements.forEach(req => {
@@ -134,7 +151,7 @@ export class ChangeParser extends MarkdownParser {
     }
     
     // Parse REMOVED requirements
-    const removedSection = this.findSection(sections, 'REMOVED Requirements');
+    const removedSection = this.findSection(sections, this.deltaSectionTitle('REMOVED'));
     if (removedSection) {
       const requirements = this.parseRequirements(removedSection);
       requirements.forEach(req => {
@@ -149,7 +166,7 @@ export class ChangeParser extends MarkdownParser {
     }
     
     // Parse RENAMED requirements
-    const renamedSection = this.findSection(sections, 'RENAMED Requirements');
+    const renamedSection = this.findSection(sections, this.deltaSectionTitle('RENAMED'));
     if (renamedSection) {
       const renames = this.parseRenames(renamedSection.content);
       renames.forEach(rename => {
@@ -172,8 +189,8 @@ export class ChangeParser extends MarkdownParser {
     let currentRename: { from?: string; to?: string } = {};
     
     for (const line of lines) {
-      const fromMatch = line.match(/^\s*-?\s*FROM:\s*`?###\s*Requirement:\s*(.+?)`?\s*$/);
-      const toMatch = line.match(/^\s*-?\s*TO:\s*`?###\s*Requirement:\s*(.+?)`?\s*$/);
+      const fromMatch = line.match(this.format.RENAME_FROM);
+      const toMatch = line.match(this.format.RENAME_TO);
       
       if (fromMatch) {
         currentRename.from = fromMatch[1].trim();
@@ -193,22 +210,28 @@ export class ChangeParser extends MarkdownParser {
     return renames;
   }
 
+  /**
+   * Parse a delta spec file's sections. Same walk as the base parser, over
+   * arbitrary content rather than this instance's own, and through the same
+   * resolved format: the structure mask, the heading shape and the depth
+   * numbering are all the format's, so an Org delta file is read as Org.
+   */
   private parseSectionsFromContent(content: string): Section[] {
     const normalizedContent = ChangeParser.normalizeContent(content);
     const lines = normalizedContent.split('\n');
-    const codeFenceLineMask = buildCodeFenceMask(lines);
+    const codeFenceLineMask = buildStructureMask(lines, this.format);
     const sections: Section[] = [];
     const stack: Section[] = [];
-    
+
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
       if (codeFenceLineMask[i]) {
         continue;
       }
-      const headerMatch = line.match(/^(#{1,6})\s+(.+)$/);
-      
+      const headerMatch = line.match(this.format.HEADING_ANY);
+
       if (headerMatch) {
-        const level = headerMatch[1].length;
+        const level = this.format.headingLevel(line)!;
         const title = headerMatch[2].trim();
         const contentLines = this.getContentUntilNextHeaderFromLines(lines, codeFenceLineMask, i + 1, level);
         
@@ -246,12 +269,12 @@ export class ChangeParser extends MarkdownParser {
     
     for (let i = startLine; i < lines.length; i++) {
       const line = lines[i];
-      const headerMatch = codeFenceLineMask[i] ? null : line.match(/^(#{1,6})\s+/);
-      
-      if (headerMatch && headerMatch[1].length <= currentLevel) {
+      const level = codeFenceLineMask[i] ? null : this.format.headingLevel(line);
+
+      if (level !== null && level <= currentLevel) {
         break;
       }
-      
+
       contentLines.push(line);
     }
     

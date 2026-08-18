@@ -1,9 +1,5 @@
-import { buildCodeFenceMask } from './code-fence.js';
-
-const REQUIREMENTS_SECTION_HEADER = /^##\s+Requirements\s*$/i;
-const TOP_LEVEL_SECTION_HEADER = /^##\s+/;
-const DELTA_HEADER = /^##\s+(ADDED|MODIFIED|REMOVED|RENAMED)\s+Requirements\s*$/i;
-const REQUIREMENT_HEADER = /^###\s+Requirement:\s*(.+)\s*$/i;
+import { buildCodeFenceMask, buildStructureMask } from './code-fence.js';
+import { defaultFormat, type ResolvedFormat } from './grammar.js';
 
 export interface MainSpecStructureIssue {
   kind: 'delta-header' | 'requirement-outside-requirements' | 'duplicate-requirement';
@@ -12,19 +8,28 @@ export interface MainSpecStructureIssue {
   message: string;
 }
 
-export function findMainSpecStructureIssues(content: string): MainSpecStructureIssue[] {
+export function findMainSpecStructureIssues(
+  content: string,
+  format: ResolvedFormat = defaultFormat()
+): MainSpecStructureIssue[] {
   const normalized = content.replace(/\r\n?/g, '\n');
-  const stripped = stripFencedCodeBlocksPreservingLines(normalized);
-  const lines = stripped.split('\n');
+  const lines = normalized.split('\n');
+  // Structure mask, not the plain fence mask: in Org a heading inside
+  // `#+begin_src` is still a heading, so the reader must see it here exactly as
+  // the parsers do, or a duplicate would slip past this check and then be
+  // parsed anyway.
+  const structural = buildStructureMask(lines, format);
   const issues: MainSpecStructureIssue[] = [];
   const requirementLines = new Map<string, number>();
 
-  const requirementsHeaderIndex = lines.findIndex(line => REQUIREMENTS_SECTION_HEADER.test(line));
+  const requirementsHeaderIndex = lines.findIndex(
+    (line, i) => !structural[i] && format.H2_REQUIREMENTS.test(line)
+  );
   let requirementsEndIndex = lines.length;
 
   if (requirementsHeaderIndex !== -1) {
     for (let i = requirementsHeaderIndex + 1; i < lines.length; i++) {
-      if (TOP_LEVEL_SECTION_HEADER.test(lines[i])) {
+      if (!structural[i] && format.H2_ANY.test(lines[i])) {
         requirementsEndIndex = i;
         break;
       }
@@ -34,24 +39,24 @@ export function findMainSpecStructureIssues(content: string): MainSpecStructureI
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     const trimmed = line.trim();
-    if (!trimmed) {
+    if (!trimmed || structural[i]) {
       continue;
     }
 
-    if (DELTA_HEADER.test(line)) {
+    if (format.H2_DELTA.test(line)) {
       issues.push({
         kind: 'delta-header',
         line: i + 1,
         header: trimmed,
         message:
           `Main spec contains delta header "${trimmed}". ` +
-          'Delta headers are only valid inside openspec/changes/<name>/specs/<capability-path>/spec.md ' +
-          'and truncate the parsed ## Requirements section.',
+          `Delta headers are only valid inside openspec/changes/<name>/specs/<capability-path>/${format.SPEC_FILE} ` +
+          `and truncate the parsed ${format.tokens.requirementsSection} section.`,
       });
       continue;
     }
 
-    const requirementMatch = line.match(REQUIREMENT_HEADER);
+    const requirementMatch = line.match(format.H3_REQUIREMENT);
     if (!requirementMatch) {
       continue;
     }
@@ -67,7 +72,7 @@ export function findMainSpecStructureIssues(content: string): MainSpecStructureI
         line: i + 1,
         header: trimmed,
         message:
-          `Requirement header "${trimmed}" appears outside the main ## Requirements section. ` +
+          `Requirement header "${trimmed}" appears outside the main ${format.tokens.requirementsSection} section. ` +
           'Main specs only parse requirements inside that section, so this requirement is currently invisible to validate, list, and archive.',
       });
       continue;
