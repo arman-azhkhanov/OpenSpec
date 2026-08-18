@@ -1,0 +1,20 @@
+:PROPERTIES:
+:ID:
+:END:
+# Fill the :ID: above with a fresh id (`uuidgen`) before committing this file.
+# Without one, [[id:...]] links elsewhere cannot target this delta. Leaving it
+# empty is deliberate: a placeholder copied out of a template would be the same
+# id in every file created from it.
+
+* Purpose
+# New capabilities only: one or two sentences (50+ characters) on what this
+# capability is for. Delete this section for an existing capability.
+
+* ADDED Requirements
+
+** Requirement: <requirement name>
+<requirement text>
+
+*** Scenario: <scenario name>
+- *WHEN* <condition>
+- *THEN* <expected outcome>
