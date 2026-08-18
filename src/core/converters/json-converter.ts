@@ -2,6 +2,7 @@ import { readFileSync } from 'fs';
 import path from 'path';
 import { MarkdownParser } from '../parsers/markdown-parser.js';
 import { ChangeParser } from '../parsers/change-parser.js';
+import { defaultFormat, type ResolvedFormat } from '../parsers/grammar.js';
 import { Spec, Change } from '../schemas/index.js';
 import { FileSystemUtils } from '../../utils/file-system.js';
 
@@ -24,11 +25,18 @@ export class JsonConverter {
     return JSON.stringify(jsonSpec, null, 2);
   }
 
-  async convertChangeToJson(filePath: string): Promise<string> {
+  /**
+   * `format` is the proposal artifact's resolved format. Callers with no schema
+   * in hand get the Markdown defaults, so their output is unchanged.
+   */
+  async convertChangeToJson(
+    filePath: string,
+    format: ResolvedFormat = defaultFormat()
+  ): Promise<string> {
     const content = readFileSync(filePath, 'utf-8');
     const changeName = this.extractNameFromPath(filePath);
     const changeDir = path.dirname(filePath);
-    const parser = new ChangeParser(content, changeDir);
+    const parser = new ChangeParser(content, changeDir, format);
     
     const change = await parser.parseChangeWithDeltas(changeName);
     

@@ -1,5 +1,6 @@
 import { promises as fs } from 'fs';
 import path from 'path';
+import { resolveSpecArtifactFormat } from '../core/validation/validator.js';
 import { discoverSpecFiles } from './spec-discovery.js';
 
 /**
@@ -26,9 +27,20 @@ export async function getActiveChangeIds(root: string = process.cwd()): Promise<
   }
 }
 
+/**
+ * Returns the ids of the project's main specs.
+ *
+ * Discovery runs under the spec artifact's declared format, the same
+ * resolution `spec list`/`validate` use: `discoverSpecFiles` matches on
+ * `format.SPEC_FILE`, so a hardcoded default made every id in an Org project
+ * invisible — and this list is what `openspec show`, `validate --specs` and
+ * shell completion offer, so "no specs found" was reported as a clean result.
+ * An unresolvable schema still yields the Markdown default, so a project that
+ * declares nothing sees no change.
+ */
 export async function getSpecIds(root: string = process.cwd()): Promise<string[]> {
   const specsPath = path.join(root, 'openspec', 'specs');
-  const discovered = await discoverSpecFiles(specsPath);
+  const discovered = await discoverSpecFiles(specsPath, resolveSpecArtifactFormat(root));
   return discovered.map((spec) => spec.id);
 }
 

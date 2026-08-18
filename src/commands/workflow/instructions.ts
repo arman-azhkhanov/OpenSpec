@@ -47,7 +47,11 @@ import {
   type ApplyInstructions,
   type ArchiveInstructions,
 } from './shared.js';
-import { parseTaskLines, type ParsedTask } from '../../utils/task-progress.js';
+import {
+  parseTaskLines,
+  resolveTaskFormatForChange,
+  type ParsedTask,
+} from '../../utils/task-progress.js';
 
 // -----------------------------------------------------------------------------
 // Types
@@ -420,7 +424,26 @@ export async function generateApplyInstructions(
     tracksFileExists = fs.existsSync(tracksPath);
     if (tracksFileExists) {
       const tasksContent = await fs.promises.readFile(tracksPath, 'utf-8');
-      parsedTasks = parseTaskLines(tasksContent);
+      // Counted through the tracked-tasks artifact's own format, which is the
+      // same resolution `openspec list` and archive's incomplete-task check
+      // use. Read with the built-in Markdown pattern instead, this checklist
+      // would silently drop every task line the change's format alone accepts
+      // (Org's `[-]` mark, `+` bullets) and disagree with those two about how
+      // many tasks the change has.
+      //
+      // Both the schema and the project config are handed over rather than
+      // re-resolved: `context.schemaName` is the schema this whole function is
+      // already using (`schema`, above), and `readProjectConfig` warns about a
+      // malformed `operations:` block on every read, so resolving the schema a
+      // second time here printed that warning twice — one per read, against the
+      // command's one-warning contract.
+      parsedTasks = parseTaskLines(
+        tasksContent,
+        resolveTaskFormatForChange(changeDir, projectRoot, undefined, {
+          schemaName: context.schemaName,
+          projectConfig: options.projectConfig,
+        })
+      );
     }
   }
   const tasks = toTaskItems(parsedTasks);

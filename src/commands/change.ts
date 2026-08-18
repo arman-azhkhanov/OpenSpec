@@ -1,14 +1,23 @@
 import { promises as fs } from 'fs';
 import path from 'path';
 import { JsonConverter } from '../core/converters/json-converter.js';
-import { Validator } from '../core/validation/validator.js';
+import { Validator, resolveSpecArtifactFormat } from '../core/validation/validator.js';
 import { VALIDATION_MESSAGES } from '../core/validation/constants.js';
 import { ChangeParser } from '../core/parsers/change-parser.js';
+import {
+  deltaHeaders,
+  resolveFormat,
+  scenarioLabel,
+  type ResolvedFormat,
+} from '../core/parsers/grammar.js';
 import { Change } from '../core/schemas/index.js';
+import type { Artifact } from '../core/artifact-graph/index.js';
+import { resolveSchema } from '../core/artifact-graph/index.js';
 import type { RootOutput } from '../core/root-selection.js';
 import { isInteractive } from '../utils/interactive.js';
 import { getActiveChangeIds } from '../utils/item-discovery.js';
 import { getTaskProgressForChange } from '../utils/task-progress.js';
+import { resolveSchemaForChange } from '../utils/change-metadata.js';
 import { FileSystemUtils } from '../utils/file-system.js';
 
 /**
@@ -48,6 +57,39 @@ export class ChangeCommand {
   }
 
   /**
+   * Resolves the change's `proposal` artifact from its schema — the same
+   * shape `findTrackedTasksArtifact` (utils/task-progress.ts) uses for the
+   * tracked-tasks artifact — or `undefined` when the schema cannot be
+   * resolved or declares no artifact with `id: proposal`. `resolveSchema`
+   * throws on an unresolvable/misnamed schema; that is swallowed here so a
+   * change whose schema cannot be read falls back to the pre-schema
+   * behavior instead of crashing `show`/`list`.
+   *
+   * MUST NOT be called before a `changeDir` is confirmed inside its
+   * `changes/` directory: a traversing `changeName` (`../..`) must be
+   * rejected on the path alone, with zero reads outside the sandbox — the
+   * same invariant `isChangeDirectoryName` exists to enforce.
+   */
+  private resolveProposalArtifact(changeDir: string, projectRoot: string): Artifact | undefined {
+    try {
+      const schemaName = resolveSchemaForChange(changeDir, undefined, projectRoot);
+      const schema = resolveSchema(schemaName, projectRoot);
+      return schema.artifacts.find((a) => a.id === 'proposal');
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * The proposal artifact's declared filename, or the classic `proposal.md`
+   * when the schema declares no `proposal` artifact — so a schema without
+   * one behaves exactly as it did before this patch.
+   */
+  private proposalFilename(artifact: Artifact | undefined): string {
+    return artifact?.generates ?? 'proposal.md';
+  }
+
+  /**
    * Show a change proposal.
    * - Text mode: raw markdown passthrough (no filters)
    * - JSON mode: minimal object with deltas; --deltas-only returns same object with filtered deltas
@@ -80,11 +122,17 @@ export class ChangeCommand {
     }
 
     const changeDir = path.join(changesPath, changeName);
-    const proposalPath = path.join(changeDir, 'proposal.md');
+    // Literal on purpose: containment is not confirmed yet, so nothing about
+    // this change — not even its schema — may be read to build this message.
+    const literalProposalPath = path.join(changeDir, 'proposal.md');
 
     if (!isChangeDirectoryName(changesPath, changeDir)) {
-      throw new Error(`Change "${changeName}" not found at ${proposalPath}`);
+      throw new Error(`Change "${changeName}" not found at ${literalProposalPath}`);
     }
+
+    const projectRoot = this.rootPath ?? process.cwd();
+    const proposalArtifact = this.resolveProposalArtifact(changeDir, projectRoot);
+    const proposalPath = path.join(changeDir, this.proposalFilename(proposalArtifact));
 
     try {
       await fs.access(proposalPath);
@@ -111,7 +159,10 @@ export class ChangeCommand {
 
     if (options?.json) {
       FileSystemUtils.assertPathWithin(changeDir, proposalPath);
-      const jsonOutput = await this.converter.convertChangeToJson(proposalPath);
+      const jsonOutput = await this.converter.convertChangeToJson(
+        proposalPath,
+        resolveFormat(proposalArtifact)
+      );
 
       if (options.requirementsOnly) {
         console.error('Flag --requirements-only is deprecated; use --deltas-only instead.');
@@ -120,7 +171,7 @@ export class ChangeCommand {
       const parsed: Change = JSON.parse(jsonOutput);
       FileSystemUtils.assertPathWithin(changeDir, proposalPath);
       const contentForTitle = await fs.readFile(proposalPath, 'utf-8');
-      const title = this.extractTitle(contentForTitle, changeName);
+      const title = this.extractTitle(contentForTitle, changeName, resolveFormat(proposalArtifact));
       const id = parsed.name;
       const deltas = parsed.deltas || [];
 
@@ -146,7 +197,10 @@ export class ChangeCommand {
    */
   async list(options?: { json?: boolean; long?: boolean }): Promise<void> {
     const changesPath = path.join(process.cwd(), 'openspec', 'changes');
-    
+    // Matches changesPath above: this deprecated noun-form command stays
+    // cwd-based (unlike `show`, which honors a root-aware caller's rootPath).
+    const projectRoot = process.cwd();
+
     // Same directory-based resolution as `openspec list`, the command this
     // deprecated alias points users at. Every output path below already
     // tolerates a change whose proposal.md is missing or unreadable.
@@ -156,7 +210,11 @@ export class ChangeCommand {
       const changeDetails = await Promise.all(
         changes.map(async (changeName) => {
           const changeDir = path.join(changesPath, changeName);
-          const proposalPath = path.join(changeDir, 'proposal.md');
+          // Safe to resolve immediately: changeName came from a real
+          // directory entry (getActiveChangeIds → fs.readdir), never from
+          // untrusted input, so there is no containment check to precede.
+          const proposalArtifact = this.resolveProposalArtifact(changeDir, projectRoot);
+          const proposalPath = path.join(changeDir, this.proposalFilename(proposalArtifact));
 
           // Resolve task progress through the shared tracked-tasks helper so
           // this deprecated noun-form list cannot re-fork the resolution
@@ -175,12 +233,12 @@ export class ChangeCommand {
           try {
             FileSystemUtils.assertPathWithin(changeDir, proposalPath);
             const content = await fs.readFile(proposalPath, 'utf-8');
-            const parser = new ChangeParser(content, changeDir);
+            const parser = new ChangeParser(content, changeDir, resolveFormat(proposalArtifact));
             const change = await parser.parseChangeWithDeltas(changeName);
 
             return {
               id: changeName,
-              title: this.extractTitle(content, changeName),
+              title: this.extractTitle(content, changeName, resolveFormat(proposalArtifact)),
               deltaCount: change.deltas.length,
               taskStatus,
             };
@@ -207,7 +265,9 @@ export class ChangeCommand {
       // Long format: id: title and minimal counts
       for (const changeName of sorted) {
         const changeDir = path.join(changesPath, changeName);
-        const proposalPath = path.join(changeDir, 'proposal.md');
+        // Safe to resolve immediately — see the JSON branch above.
+        const proposalArtifact = this.resolveProposalArtifact(changeDir, projectRoot);
+        const proposalPath = path.join(changeDir, this.proposalFilename(proposalArtifact));
         const { total, completed } = await getTaskProgressForChange(changesPath, changeName, process.cwd());
         const taskStatusText = total > 0 ? ` [tasks ${completed}/${total}]` : '';
         if (await isDefinitelyMissing(proposalPath)) {
@@ -217,8 +277,8 @@ export class ChangeCommand {
         try {
           FileSystemUtils.assertPathWithin(changeDir, proposalPath);
           const content = await fs.readFile(proposalPath, 'utf-8');
-          const title = this.extractTitle(content, changeName);
-          const parser = new ChangeParser(content, changeDir);
+          const title = this.extractTitle(content, changeName, resolveFormat(proposalArtifact));
+          const parser = new ChangeParser(content, changeDir, resolveFormat(proposalArtifact));
           const change = await parser.parseChangeWithDeltas(changeName);
           const deltaCountText = ` [deltas ${change.deltas.length}]`;
           console.log(`${changeName}: ${title}${deltaCountText}${taskStatusText}`);
@@ -265,11 +325,14 @@ export class ChangeCommand {
     }
     
     const validator = new Validator(options?.strict || false);
+    const projectRoot = path.dirname(path.dirname(changesPath));
+    const changeFormat = resolveSpecArtifactFormat(projectRoot, changeDir);
     const report = await validator.validateChangeDeltaSpecs(changeDir, {
       // Derived from changesPath so the main specs come from the same root the
       // change itself was resolved against.
       mainSpecsDir: path.join(path.dirname(changesPath), 'specs'),
-      projectRoot: path.dirname(path.dirname(changesPath)),
+      projectRoot,
+      format: changeFormat,
     });
     
     if (options?.json) {
@@ -284,8 +347,9 @@ export class ChangeCommand {
           const prefix = issue.level === 'ERROR' ? '✗' : '⚠';
           console.error(`${prefix} [${label}] ${issue.path}: ${issue.message}`);
         });
-        // Next steps footer to guide fixing issues
-        this.printNextSteps(report.issues);
+        // Next steps footer to guide fixing issues, named in the change's own
+        // markup — the same format `validateChangeDeltaSpecs` just read it in.
+        this.printNextSteps(report.issues, changeFormat);
         if (!options?.json) {
           process.exitCode = 1;
         }
@@ -293,12 +357,35 @@ export class ChangeCommand {
     }
   }
 
-  private extractTitle(content: string, changeName: string): string {
+  /**
+   * `format` defaults to the built-in Markdown resolution so a call site
+   * with no schema in hand (there is none left in this file, but the
+   * default keeps the signature safe for a future one) keeps today's
+   * behavior — same convention `resolveFormat` itself documents.
+   *
+   * FORK-ONLY branch: Org has no `# ` heading (a bare `#` line is an Org
+   * comment, not structure — deliberately NOT matched here, so a proposal
+   * that only carries comment lines falls through to `changeName` exactly
+   * like a Markdown proposal with no `#` line does); its title lives in the
+   * `#+TITLE:` keyword line instead.
+   */
+  private extractTitle(
+    content: string,
+    changeName: string,
+    format: ResolvedFormat = resolveFormat()
+  ): string {
+    if (format.markup === 'org') {
+      const match = content.match(/^#\+TITLE:\s*(.+)$/im);
+      return match ? match[1].trim() : changeName;
+    }
     const match = content.match(/^#\s+(?:Change:\s+)?(.+)$/im);
     return match ? match[1].trim() : changeName;
   }
 
-  private printNextSteps(issues: Array<{ message: string }> = []): void {
+  private printNextSteps(
+    issues: Array<{ message: string }> = [],
+    format: ResolvedFormat = resolveFormat()
+  ): void {
     const bullets: string[] = [];
     // Branch on the exact marker messages: the generic no-deltas guidance
     // also mentions skip_specs and must not trigger the marker bullets.
@@ -315,8 +402,14 @@ export class ChangeCommand {
       bullets.push('- Fix .openspec.yaml so the skip_specs marker can be honored (schema: <name> is required)');
       bullets.push('- Or remove skip_specs from .openspec.yaml and add delta specs instead');
     } else {
-      bullets.push('- Ensure change has deltas in specs/: use headers ## ADDED/MODIFIED/REMOVED/RENAMED Requirements');
-      bullets.push('- Each requirement MUST include at least one #### Scenario: block');
+      // Rendered from the format's own header tokens through the SAME two
+      // helpers `openspec validate` uses, not from Markdown literals: this
+      // footer is the instruction an author follows to fix the very file that
+      // failed validation, so quoting hash-prefixed delta and scenario headers
+      // at an Org project names headers its parser cannot see. Markdown output
+      // is byte-identical to the literals this replaces.
+      bullets.push(`- Ensure change has deltas in specs/: use headers ${deltaHeaders(format)}`);
+      bullets.push(`- Each requirement MUST include at least one ${scenarioLabel(format)} block`);
       bullets.push('- Debug parsed deltas: openspec change show <id> --json --deltas-only');
     }
     console.error('Next steps:');

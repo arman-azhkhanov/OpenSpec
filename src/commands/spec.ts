@@ -2,7 +2,8 @@ import { program } from 'commander';
 import { existsSync, readFileSync } from 'fs';
 import path, { join } from 'path';
 import { MarkdownParser } from '../core/parsers/markdown-parser.js';
-import { Validator } from '../core/validation/validator.js';
+import { Validator, resolveSpecArtifactFormat } from '../core/validation/validator.js';
+import { defaultFormat, type ResolvedFormat } from '../core/parsers/grammar.js';
 import type { Spec } from '../core/schemas/index.js';
 import type { RootOutput } from '../core/root-selection.js';
 import { isInteractive } from '../utils/interactive.js';
@@ -23,7 +24,7 @@ function assertSpecPath(specsDir: string, specPath: string): void {
   }
 
   try {
-    // Preserve confined spec.md links, including links to a sibling capability.
+    // Preserve confined spec-file links, including links to a sibling capability.
     FileSystemUtils.assertPathWithin(specsDir, specPath);
   } catch {
     // A capability directory may intentionally be a monorepo symlink. Treat it
@@ -42,10 +43,15 @@ interface ShowOptions {
   rootOutput?: RootOutput;
 }
 
-function parseSpecFromFile(specsDir: string, specPath: string, specId: string): Spec {
+function parseSpecFromFile(
+  specsDir: string,
+  specPath: string,
+  specId: string,
+  format: ResolvedFormat = defaultFormat()
+): Spec {
   assertSpecPath(specsDir, specPath);
   const content = readFileSync(specPath, 'utf-8');
-  const parser = new MarkdownParser(content);
+  const parser = new MarkdownParser(content, format);
   return parser.parseSpec(specId);
 }
 
@@ -116,12 +122,18 @@ export class SpecCommand {
       }
     }
 
-    const specPath = join(this.specsDir, specId, 'spec.md');
+    // The spec file name and the shape its content is read in both come from
+    // the project's schema, so a project whose specs are not `spec.md` is found
+    // and parsed rather than reported missing.
+    const format = resolveSpecArtifactFormat(this.rootPath ?? process.cwd());
+    const specPath = join(this.specsDir, specId, format.SPEC_FILE);
     assertSpecPath(this.specsDir, specPath);
     if (!existsSync(specPath)) {
       // Root-aware callers get the absolute path; the cwd-based noun form
       // keeps its historical forward-slash relative message on all platforms.
-      const displayPath = this.rootPath ? specPath : `openspec/specs/${specId}/spec.md`;
+      const displayPath = this.rootPath
+        ? specPath
+        : `openspec/specs/${specId}/${format.SPEC_FILE}`;
       throw new Error(`Spec '${specId}' not found at ${displayPath}`);
     }
 
@@ -129,7 +141,7 @@ export class SpecCommand {
       if (options.requirements && options.requirement) {
         throw new Error('Options --requirements and --requirement cannot be used together');
       }
-      const parsed = parseSpecFromFile(this.specsDir, specPath, specId);
+      const parsed = parseSpecFromFile(this.specsDir, specPath, specId, format);
       const filtered = filterSpec(parsed, options);
       const output = {
         id: specId,
@@ -187,12 +199,13 @@ export function registerSpecCommand(rootProgram: typeof program) {
           return;
         }
 
-        const discovered = await discoverSpecFiles(SPECS_DIR);
+        const format = resolveSpecArtifactFormat(process.cwd());
+        const discovered = await discoverSpecFiles(SPECS_DIR, format);
         const specs = discovered
           .map(({ id, specFile }) => {
             try {
               assertSpecPath(SPECS_DIR, specFile);
-              const spec = parseSpecFromFile(SPECS_DIR, specFile, id);
+              const spec = parseSpecFromFile(SPECS_DIR, specFile, id, format);
 
               return {
                 id,
@@ -252,16 +265,19 @@ export function registerSpecCommand(rootProgram: typeof program) {
           }
         }
 
-        const specPath = join(SPECS_DIR, specId, 'spec.md');
+        const format = resolveSpecArtifactFormat(process.cwd());
+        const specPath = join(SPECS_DIR, specId, format.SPEC_FILE);
         assertSpecPath(SPECS_DIR, specPath);
-        
+
         if (!existsSync(specPath)) {
-          throw new Error(`Spec '${specId}' not found at openspec/specs/${specId}/spec.md`);
+          throw new Error(
+            `Spec '${specId}' not found at openspec/specs/${specId}/${format.SPEC_FILE}`
+          );
         }
 
         const validator = new Validator(options.strict);
         assertSpecPath(SPECS_DIR, specPath);
-        const report = await validator.validateSpec(specPath);
+        const report = await validator.validateSpec(specPath, format);
 
         if (options.json) {
           console.log(JSON.stringify(report, null, 2));

@@ -4,6 +4,7 @@ import chalk from 'chalk';
 import { getTaskProgressForChange, formatTaskStatus } from '../utils/task-progress.js';
 import { MarkdownParser } from './parsers/markdown-parser.js';
 import { discoverSpecFiles } from '../utils/spec-discovery.js';
+import { resolveSpecArtifactFormat } from './validation/validator.js';
 
 export class ViewCommand {
   async execute(targetPath: string = '.'): Promise<void> {
@@ -139,10 +140,17 @@ export class ViewCommand {
 
     const specs: Array<{ name: string; requirementCount: number }> = [];
 
-    for (const { id, specFile } of await discoverSpecFiles(specsDir)) {
+    // Same resolution as `list`: `discoverSpecFiles` matches the format's
+    // `SPEC_FILE`, so the dashboard counted zero specs and zero requirements in
+    // an Org project while reporting it as an empty-but-healthy root.
+    // `openspecDir` is always `<projectRoot>/openspec`, so its parent is the
+    // root the schema is resolved against (as `getChangesData` already does).
+    const format = resolveSpecArtifactFormat(path.dirname(openspecDir));
+
+    for (const { id, specFile } of await discoverSpecFiles(specsDir, format)) {
       try {
         const content = fs.readFileSync(specFile, 'utf-8');
-        const parser = new MarkdownParser(content);
+        const parser = new MarkdownParser(content, format);
         const spec = parser.parseSpec(id);
         const requirementCount = spec.requirements.length;
         specs.push({ name: id, requirementCount });

@@ -5,6 +5,7 @@ import { readFileSync, type Dirent } from 'fs';
 import { MarkdownParser } from './parsers/markdown-parser.js';
 import type { RootOutput } from './root-selection.js';
 import { discoverSpecFiles } from '../utils/spec-discovery.js';
+import { resolveSpecArtifactFormat } from './validation/validator.js';
 
 interface ChangeInfo {
   name: string;
@@ -177,7 +178,14 @@ export class ListCommand {
       return;
     }
 
-    const discovered = await discoverSpecFiles(specsDir);
+    // Resolved once from the project's spec artifact and carried through both
+    // discovery and parsing: `discoverSpecFiles` matches the format's
+    // `SPEC_FILE`, so the Markdown default reported an Org project as "No specs
+    // found." — a zero indistinguishable from an empty project — and parsing
+    // the file it did find with Markdown headers would then have counted zero
+    // requirements in it.
+    const format = resolveSpecArtifactFormat(targetPath);
+    const discovered = await discoverSpecFiles(specsDir, format);
     if (discovered.length === 0) {
       if (json) {
         console.log(JSON.stringify({ specs: [], ...(root ? { root } : {}) }, null, 2));
@@ -192,7 +200,7 @@ export class ListCommand {
     for (const { id, specFile } of discovered) {
       try {
         const content = readFileSync(specFile, 'utf-8');
-        const parser = new MarkdownParser(content);
+        const parser = new MarkdownParser(content, format);
         const spec = parser.parseSpec(id);
         specs.push({ id, requirementCount: spec.requirements.length });
       } catch {
