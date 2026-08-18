@@ -1,5 +1,6 @@
 import * as fs from 'node:fs';
 import { parse as parseYaml } from 'yaml';
+import { collectFormatIssues } from '../parsers/grammar.js';
 import { SchemaYamlSchema, type SchemaYaml, type Artifact } from './types.js';
 
 export class SchemaValidationError extends Error {
@@ -26,7 +27,9 @@ export function parseSchema(yamlContent: string): SchemaYaml {
   // Validate with Zod
   const result = SchemaYamlSchema.safeParse(parsed);
   if (!result.success) {
-    const errors = result.error.issues.map(e => `${e.path.join('.')}: ${e.message}`).join(', ');
+    const errors = result.error.issues
+      .map(e => `${e.path.join('.')}: ${e.message}${describeFormatArtifact(parsed, e.path)}`)
+      .join(', ');
     throw new SchemaValidationError(`Invalid schema: ${errors}`);
   }
 
@@ -41,7 +44,41 @@ export function parseSchema(yamlContent: string): SchemaYaml {
   // Check for cycles
   validateNoCycles(schema.artifacts);
 
+  // Check that every declared format block can be honored
+  validateFormatDeclarations(schema.artifacts);
+
   return schema;
+}
+
+/**
+ * Names the artifact behind a `format` block issue. Zod reports the block by
+ * position, and a schema author needs the id. Only format paths are annotated,
+ * so every other message reads exactly as it did.
+ */
+function describeFormatArtifact(parsed: unknown, path: ReadonlyArray<PropertyKey>): string {
+  if (path[0] !== 'artifacts' || typeof path[1] !== 'number' || path[2] !== 'format') {
+    return '';
+  }
+
+  const artifacts = (parsed as { artifacts?: unknown } | null)?.artifacts;
+  if (!Array.isArray(artifacts)) {
+    return '';
+  }
+
+  const id = (artifacts[path[1]] as { id?: unknown } | undefined)?.id;
+  return typeof id === 'string' && id.length > 0 ? ` (artifact '${id}')` : '';
+}
+
+/**
+ * Validates the declared `format` blocks. A block that cannot be honored is an
+ * error here rather than a silent drop at parse time: the author of a dropped
+ * declaration cannot tell it from one that took effect.
+ */
+function validateFormatDeclarations(artifacts: Artifact[]): void {
+  const issues = artifacts.flatMap(artifact => collectFormatIssues(artifact));
+  if (issues.length > 0) {
+    throw new SchemaValidationError(`Invalid format declaration: ${issues.join('; ')}`);
+  }
 }
 
 /**

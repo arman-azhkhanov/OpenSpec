@@ -21,6 +21,34 @@ function relativePathSchema(fieldName: string) {
     });
 }
 
+/**
+ * Per-artifact declaration of the token shapes its content is written in.
+ *
+ * Optional at every level: an artifact without the block, and a schema whose
+ * artifacts all omit it, resolve to the built-in defaults
+ * (`resolveFormat` in src/core/parsers/grammar.ts), which reproduce the
+ * literals the parsers carried before this field existed.
+ *
+ * The object is STRICT on purpose. An unknown key inside the block is reported
+ * rather than stripped, because a silently discarded declaration is
+ * indistinguishable to the author from one that took effect — which is the
+ * behavior this field is here to end.
+ */
+export const ArtifactFormatSchema = z.strictObject({
+  // Declarable token shapes. `{name}` / `{operation}` mark the captured part;
+  // the loader compiles them, so a schema never supplies a regex.
+  requirementsSection: z.string().optional(),
+  requirementHeader: z.string().optional(),
+  scenarioHeader: z.string().optional(),
+  deltaSection: z.string().optional(),
+  normativeKeywords: z.array(z.string()).optional(),
+  // FORK-ONLY beyond this line: the markup family selects the shapes no token
+  // template can express (heading marker, fence syntax, bullet and checkbox
+  // classes, property drawers, body escaping). Registered here so a schema
+  // declaring it is not rejected by this object's own strictness.
+  markup: z.enum(['markdown', 'org']).optional(),
+});
+
 // Artifact definition schema
 export const ArtifactSchema = z.object({
   id: z.string().min(1, { error: 'Artifact ID is required' }),
@@ -29,6 +57,7 @@ export const ArtifactSchema = z.object({
   template: relativePathSchema('template field'),
   instruction: z.string().optional(),
   requires: z.array(z.string()).default([]),
+  format: ArtifactFormatSchema.optional(),
 });
 
 // Apply phase configuration for schema-aware apply instructions
@@ -52,6 +81,7 @@ export const SchemaYamlSchema = z.object({
 });
 
 // Derived TypeScript types
+export type ArtifactFormat = z.infer<typeof ArtifactFormatSchema>;
 export type Artifact = z.infer<typeof ArtifactSchema>;
 export type ApplyPhase = z.infer<typeof ApplyPhaseSchema>;
 export type SchemaYaml = z.infer<typeof SchemaYamlSchema>;
