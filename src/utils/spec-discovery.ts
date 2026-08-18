@@ -1,11 +1,12 @@
 import { promises as fs } from 'fs';
 import path from 'path';
 import { FileSystemUtils } from './file-system.js';
+import { defaultFormat, type ResolvedFormat } from '../core/parsers/grammar.js';
 
 export interface DiscoveredSpec {
   /** Spec id relative to the specs root, forward-slash separated on every platform (e.g. "web" or "platform/session-layout"). */
   id: string;
-  /** Path to the spec.md file (absolute if the specs root is absolute). */
+  /** Path to the spec file (`format.SPEC_FILE`; `spec.md` for the built-in default), absolute if the specs root is absolute. */
   specFile: string;
 }
 
@@ -20,13 +21,17 @@ function assertDiscoveredSpecPath(specsRoot: string, capabilityDir: string, spec
 }
 
 /**
- * Recursively discover every `spec.md` under a specs root, so both the flat
- * `specs/<id>/spec.md` layout and nested `specs/<area>/<id>/spec.md` layouts
- * are found (#1353). A `spec.md` sitting directly in the root is ignored,
- * matching the historical requirement that specs live in a capability folder.
- * Dot-directories are skipped and symlinked directories are not followed.
- * An in-capability symlinked `spec.md` IS resolved: `hasAnyFileUnder` and the
- * artifact graph's globs both count it as content, so dropping it here would
+ * Recursively discover every spec file (`format.SPEC_FILE`) under a specs
+ * root, so both the flat `specs/<id>/<SPEC_FILE>` layout and nested
+ * `specs/<area>/<id>/<SPEC_FILE>` layouts are found (#1353). A `format`
+ * left undeclared resolves to the built-in Markdown default (`spec.md`),
+ * which is byte-identical to this function's behavior before `format` was
+ * resolvable, so a project that declares nothing sees no change. A spec
+ * file sitting directly in the root is ignored, matching the historical
+ * requirement that specs live in a capability folder. Dot-directories are
+ * skipped and symlinked directories are not followed. An in-capability
+ * symlinked spec file IS resolved: `hasAnyFileUnder` and the artifact
+ * graph's globs both count it as content, so dropping it here would
  * silently lose the delta on archive. A link outside its capability is
  * rejected and a dangling link is skipped. Results are sorted by id.
  *
@@ -35,7 +40,10 @@ function assertDiscoveredSpecPath(specsRoot: string, capabilityDir: string, spec
  * archive/apply merge path, silently dropping an unreadable capability would
  * recreate the exact data-loss class #1353 is closing.
  */
-export async function discoverSpecFiles(specsRoot: string): Promise<DiscoveredSpec[]> {
+export async function discoverSpecFiles(
+  specsRoot: string,
+  format: ResolvedFormat = defaultFormat()
+): Promise<DiscoveredSpec[]> {
   const results: DiscoveredSpec[] = [];
   const walk = async (dir: string, segments: string[]): Promise<void> => {
     let entries;
@@ -49,7 +57,7 @@ export async function discoverSpecFiles(specsRoot: string): Promise<DiscoveredSp
       if (entry.name.startsWith('.')) continue;
       if (entry.isDirectory()) {
         await walk(path.join(dir, entry.name), [...segments, entry.name]);
-      } else if (entry.name === 'spec.md' && segments.length > 0) {
+      } else if (entry.name === format.SPEC_FILE && segments.length > 0) {
         const specFile = path.join(dir, entry.name);
         if (entry.isFile()) {
           assertDiscoveredSpecPath(specsRoot, dir, specFile);
