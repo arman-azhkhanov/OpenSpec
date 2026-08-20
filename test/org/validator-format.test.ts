@@ -495,12 +495,17 @@ describe('validator: validateChange words its remediation in the given format (m
   });
 
   it('archive passes its resolved format to that call', async () => {
-    // A source lock, deliberately: the argument's only effect is the wording
-    // above, and archive reaches this call through `proposal.md` — a literal
-    // that is NOT resolved from the schema (archive.ts:1173, outside this
-    // fix's scope), so in an org project the call is never made and no
-    // behavioural test can observe the fix. This keeps the argument from being
-    // dropped again in the meantime.
+    // A source lock on the argument's presence, kept because a caller can drop
+    // it back to the default without any behavioural test noticing which of the
+    // two callers regressed.
+    //
+    // ⚠ The premise this comment used to carry is DEAD and was wrong to leave
+    // standing: it said archive reaches this call through a hard-coded
+    // `proposal.md`, "so in an org project the call is never made and no
+    // behavioural test can observe the fix". `resolveProposalPath` resolves the
+    // proposal from the schema's `generates`, the call IS made on org projects
+    // (archive prints `Proposal warnings in proposal.org`), and the behaviour is
+    // observed in `test/org/validate.test.ts` §F-7. Measured 0820b.
     const source = await fs.readFile(
       path.join(process.cwd(), 'src', 'core', 'archive.ts'),
       'utf-8'

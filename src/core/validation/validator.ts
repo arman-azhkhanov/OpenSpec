@@ -179,7 +179,12 @@ export class Validator {
     try {
       const content = readFileSync(filePath, 'utf-8');
       const changeDir = path.dirname(filePath);
-      const parser = new ChangeParser(content, changeDir);
+      // The format this pass was handed has to reach the reader, not just the
+      // error wording below: without it the parser looked for `## Why` in a
+      // document whose sections are `* Why`, so archive warned "Change must
+      // have a Why section" on org changes that have one — and the enrichment
+      // dressed that false positive in the org headers it had failed to read.
+      const parser = new ChangeParser(content, changeDir, format);
 
       const change = await parser.parseChangeWithDeltas(changeName);
 

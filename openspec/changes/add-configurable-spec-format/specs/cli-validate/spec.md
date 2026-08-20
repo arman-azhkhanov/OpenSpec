@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Recognition SHALL use the format declared by the active schema
-Requirement headers, scenario headers, the requirements section, and delta operation sections SHALL be recognized using the format resolved from the artifact definition of the schema that owns the item being validated. A change SHALL resolve its schema from the change's own `.openspec.yaml`; a main spec SHALL resolve it from the schema whose artifact `generates` glob matches the spec file. When no schema is available to a call site, recognition SHALL fall back to the built-in defaults, so that direct file validation behaves as it does today.
+Requirement headers, scenario headers, the requirements section, and delta operation sections SHALL be recognized using the format resolved from the artifact definition of the schema that owns the item being validated. A change SHALL resolve its schema from the change's own `.openspec.yaml`; a main spec SHALL take its format from the artifact — of that same one active schema — whose `generates` glob matches the spec file. The glob selects the artifact within the schema, never the schema: a project has one active schema, resolved from `.openspec.yaml`/`config.yaml`. When no schema is available to a call site, recognition SHALL fall back to the built-in defaults, so that direct file validation behaves as it does today.
 
 #### Scenario: Declared requirement header is recognized
 - **GIVEN** a schema whose spec artifact declares a `requirementHeader` other than the built-in one

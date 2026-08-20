@@ -1,5 +1,9 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import path from 'path';
+import os from 'os';
+import { promises as fs } from 'fs';
 import { Validator } from '../../src/core/validation/validator.js';
+import { ChangeCommand } from '../../src/commands/change.js';
 import { MarkdownParser } from '../../src/core/parsers/markdown-parser.js';
 import { findMainSpecStructureIssues } from '../../src/core/parsers/spec-structure.js';
 import { resolveFormat } from '../../src/core/parsers/grammar.js';
@@ -253,5 +257,243 @@ describe('org: main spec structure issues speak org', () => {
     // An org document read as markdown yields nothing, which is exactly why
     // the format has to reach this function at all.
     expect(findMainSpecStructureIssues('* Requirements\n\n* ADDED Requirements\n')).toEqual([]);
+  });
+});
+
+// -----------------------------------------------------------------------------
+// Deprecated `openspec change validate` on an org project (m-B1 lock).
+//
+// The fix this locks is `format: changeFormat` in ChangeCommand.validate's call
+// to validateChangeDeltaSpecs (change.ts). Nothing in the suite exercised the
+// deprecated command on an org project (acc3 §6: `grep -rln "ChangeCommand" test/org/`
+// = 0 files), so the fix rested on a hand probe. Removing that one argument turns
+// the valid org change below into `Change must have at least one delta` — the
+// exact m-B1 symptom — while the Markdown twin stays green, which is why both
+// cells are asserted here.
+// -----------------------------------------------------------------------------
+
+describe('org: the deprecated change validate reads deltas in the project markup (m-B1)', () => {
+  const ORG_PROPOSAL = [
+    '#+TITLE: Add data export',
+    '',
+    '* Why',
+    '',
+    'Users cannot take their data out of the product today, and support runs exports by hand.',
+    '',
+    '* What Changes',
+    '',
+    '- Add a CSV export endpoint.',
+    '',
+  ].join('\n');
+
+  const MD_PROPOSAL = [
+    '# Add data export',
+    '',
+    '## Why',
+    '',
+    'Users cannot take their data out of the product today, and support runs exports by hand.',
+    '',
+    '## What Changes',
+    '',
+    '- Add a CSV export endpoint.',
+    '',
+  ].join('\n');
+
+  const ORG_DELTA = [
+    '* ADDED Requirements',
+    '',
+    '** Requirement: User can export data',
+    'The system SHALL allow users to export their data in CSV format.',
+    '',
+    '*** Scenario: Successful export',
+    '- *WHEN* the user asks for an export',
+    '- *THEN* the system writes a CSV file',
+    '',
+  ].join('\n');
+
+  const MD_DELTA = [
+    '## ADDED Requirements',
+    '',
+    '### Requirement: User can export data',
+    'The system SHALL allow users to export their data in CSV format.',
+    '',
+    '#### Scenario: Successful export',
+    '- **WHEN** the user asks for an export',
+    '- **THEN** the system writes a CSV file',
+    '',
+  ].join('\n');
+
+  let root: string;
+  let originalCwd: string;
+
+  beforeEach(async () => {
+    originalCwd = process.cwd();
+    root = await fs.mkdtemp(path.join(os.tmpdir(), 'openspec-org-mb1-'));
+  });
+
+  afterEach(async () => {
+    process.chdir(originalCwd);
+    await fs.rm(root, { recursive: true, force: true });
+    process.exitCode = 0;
+  });
+
+  /** A project whose schema is `schema`, holding one change named `probe`. */
+  async function project(
+    schema: string,
+    proposalFile: string,
+    proposal: string,
+    specFile: string,
+    delta: string
+  ): Promise<string> {
+    const dir = path.join(root, schema);
+    const changeDir = path.join(dir, 'openspec', 'changes', 'probe');
+    await fs.mkdir(path.join(changeDir, 'specs', 'data-export'), { recursive: true });
+    await fs.mkdir(path.join(dir, 'openspec', 'specs'), { recursive: true });
+    await fs.writeFile(path.join(dir, 'openspec', 'config.yaml'), `schema: ${schema}\n`, 'utf-8');
+    await fs.writeFile(path.join(changeDir, '.openspec.yaml'), `schema: ${schema}\n`, 'utf-8');
+    await fs.writeFile(path.join(changeDir, proposalFile), proposal, 'utf-8');
+    await fs.writeFile(path.join(changeDir, 'specs', 'data-export', specFile), delta, 'utf-8');
+    return dir;
+  }
+
+  /** Runs the deprecated command in `dir` and returns the JSON report it prints. */
+  async function changeValidate(dir: string): Promise<{ valid: boolean; issues: Array<{ message: string }> }> {
+    const logs: string[] = [];
+    const origLog = console.log;
+    const origErr = console.error;
+    process.chdir(dir);
+    try {
+      console.log = (msg?: any, ...args: any[]) => {
+        logs.push([msg, ...args].filter(Boolean).join(' '));
+      };
+      console.error = () => {};
+      await new ChangeCommand().validate('probe', { json: true });
+    } finally {
+      console.log = origLog;
+      console.error = origErr;
+    }
+    // The deprecation notice goes to stderr; stdout is the report alone.
+    return JSON.parse(logs.join('\n'));
+  }
+
+  it('calls a valid org change valid', async () => {
+    const dir = await project('ibalta-org', 'proposal.org', ORG_PROPOSAL, 'spec.org', ORG_DELTA);
+
+    const report = await changeValidate(dir);
+
+    // Reddens with `format: changeFormat` removed from the call: the org delta
+    // headers become invisible and the report is
+    // "Change must have at least one delta" (acc3 §3, both signs).
+    expect(report.valid).toBe(true);
+  });
+
+  it('calls the Markdown twin valid (control: the plant above must not redden this one)', async () => {
+    const dir = await project('spec-driven', 'proposal.md', MD_PROPOSAL, 'spec.md', MD_DELTA);
+
+    expect((await changeValidate(dir)).valid).toBe(true);
+  });
+
+  it('still reddens on an org change whose requirement has no scenario (negative control)', async () => {
+    // Without this, "valid: true" above is not evidence: a command that called
+    // everything valid would satisfy it. Subtracting the single Scenario block
+    // is the live redaction of readiness criterion 4 (patch plan §5).
+    const noScenario = ORG_DELTA.split('*** Scenario:')[0];
+    expect(noScenario).not.toBe(ORG_DELTA);
+    const dir = await project('ibalta-org', 'proposal.org', ORG_PROPOSAL, 'spec.org', noScenario);
+
+    const report = await changeValidate(dir);
+
+    expect(report.valid).toBe(false);
+    expect(messagesOf(report)).toMatch(/at least one scenario/i);
+  });
+});
+
+// -----------------------------------------------------------------------------
+// `Validator.validateChange` and the proposal's own markup (F-7 lock).
+//
+// The proposal-level pass built its ChangeParser without the format it was
+// handed, so it looked for `## Why` in a document whose sections are `* Why`
+// (validator.ts, recon R3 §4.1). Archive's non-blocking warning printed
+// "Change must have a Why section" on every org change that has one — the
+// message even quoted the org headers, because only the enrichment was
+// format-aware. This locks the parse, not the wording.
+// -----------------------------------------------------------------------------
+
+describe('org: the proposal pass reads the proposal in its own markup (F-7)', () => {
+  const WHY_LINE = 'Users cannot take their data out of the product today, and support runs exports by hand.';
+
+  const ORG_PROPOSAL = ['#+TITLE: Add data export', '', '* Why', '', WHY_LINE, '', '* What Changes', '', '- Add a CSV export endpoint.', ''].join('\n');
+  const ORG_PROPOSAL_NO_WHY = ['#+TITLE: Add data export', '', '* What Changes', '', '- Add a CSV export endpoint.', ''].join('\n');
+  const MD_PROPOSAL = ['# Add data export', '', '## Why', '', WHY_LINE, '', '## What Changes', '', '- Add a CSV export endpoint.', ''].join('\n');
+  const MD_PROPOSAL_NO_WHY = ['# Add data export', '', '## What Changes', '', '- Add a CSV export endpoint.', ''].join('\n');
+
+  const ORG_DELTA = ['* ADDED Requirements', '', '** Requirement: User can export data', 'The system SHALL allow users to export their data in CSV format.', '', '*** Scenario: Successful export', '- *WHEN* the user asks for an export', '- *THEN* the system writes a CSV file', ''].join('\n');
+  const MD_DELTA = ['## ADDED Requirements', '', '### Requirement: User can export data', 'The system SHALL allow users to export their data in CSV format.', '', '#### Scenario: Successful export', '- **WHEN** the user asks for an export', '- **THEN** the system writes a CSV file', ''].join('\n');
+
+  const MISSING_WHY = /Change must have a Why section/;
+
+  let root: string;
+
+  beforeEach(async () => {
+    root = await fs.mkdtemp(path.join(os.tmpdir(), 'openspec-org-f7-'));
+  });
+
+  afterEach(async () => {
+    await fs.rm(root, { recursive: true, force: true });
+  });
+
+  /** Writes a change directory and returns the path of its proposal. */
+  async function change(
+    name: string,
+    proposalFile: string,
+    proposal: string,
+    specFile: string,
+    delta: string
+  ): Promise<string> {
+    const changeDir = path.join(root, name);
+    await fs.mkdir(path.join(changeDir, 'specs', 'data-export'), { recursive: true });
+    await fs.writeFile(path.join(changeDir, 'specs', 'data-export', specFile), delta, 'utf-8');
+    const proposalPath = path.join(changeDir, proposalFile);
+    await fs.writeFile(proposalPath, proposal, 'utf-8');
+    return proposalPath;
+  }
+
+  it('does not claim an org proposal is missing the Why section it has', async () => {
+    const proposal = await change('probe', 'proposal.org', ORG_PROPOSAL, 'spec.org', ORG_DELTA);
+
+    const report = await new Validator().validateChange(proposal, ORG);
+
+    expect(messagesOf(report)).not.toMatch(MISSING_WHY);
+    expect(report.valid).toBe(true);
+  });
+
+  it('still says so when the org proposal really has no Why section', async () => {
+    // The other sign. Without it, passing any format that silenced the check
+    // would satisfy the assertion above.
+    const proposal = await change('probe', 'proposal.org', ORG_PROPOSAL_NO_WHY, 'spec.org', ORG_DELTA);
+
+    const report = await new Validator().validateChange(proposal, ORG);
+
+    expect(messagesOf(report)).toMatch(MISSING_WHY);
+    // Named in the reader's own markup, which is what made the false positive
+    // above so convincing.
+    expect(messagesOf(report)).toContain('"* Why"');
+  });
+
+  it('reads a Markdown proposal exactly as before (control, both signs)', async () => {
+    const withWhy = await change('mdok', 'proposal.md', MD_PROPOSAL, 'spec.md', MD_DELTA);
+    const without = await change('mdbad', 'proposal.md', MD_PROPOSAL_NO_WHY, 'spec.md', MD_DELTA);
+
+    expect(messagesOf(await new Validator().validateChange(withWhy))).not.toMatch(MISSING_WHY);
+    expect(messagesOf(await new Validator().validateChange(without))).toMatch(MISSING_WHY);
+  });
+
+  it('reads an org proposal as Markdown when no format is passed (unresolved callers unchanged)', async () => {
+    // The default is Markdown by design (ChangeParser's constructor note), and
+    // that default is what made the defect invisible: it is asserted, not left
+    // to be rediscovered.
+    const proposal = await change('probe', 'proposal.org', ORG_PROPOSAL, 'spec.org', ORG_DELTA);
+
+    expect(messagesOf(await new Validator().validateChange(proposal))).toMatch(MISSING_WHY);
   });
 });

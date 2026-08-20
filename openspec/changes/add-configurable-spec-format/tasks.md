@@ -11,7 +11,7 @@
 - [ ] 2.2 Do the same for `src/core/parsers/requirement-blocks.ts` (requirement block boundaries) and `src/core/parsers/change-parser.ts` (delta sections, `FROM:`/`TO:` rename forms).
 - [ ] 2.3 Make `containsShallOrMust` in `src/core/parsers/requirement-text.ts` take the declared keywords, compiled with word boundaries from literal keywords (never interpolating a user-supplied regex).
 - [ ] 2.4 Thread the resolved format into `src/core/validation/validator.ts` and quote declared tokens in `src/core/validation/constants.ts` messages.
-- [ ] 2.5 Resolve the format per item in `src/commands/validate.ts`: a change from its `.openspec.yaml` schema, a main spec from the schema whose artifact `generates` glob matches it; fall back to defaults when no schema is available.
+- [ ] 2.5 Resolve the format per item in `src/commands/validate.ts`: a change from its `.openspec.yaml` schema, a main spec from the artifact of that same active schema whose `generates` glob matches it; fall back to defaults when no schema is available.
 
 ## 3. Emission
 
